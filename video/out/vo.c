@@ -276,10 +276,12 @@ static struct vo *vo_create(bool probing, struct mpv_global *global,
         talloc_free(log);
         return NULL;
     };
+    const struct vo_driver *driver = desc.p;
     struct vo *vo = talloc_ptrtype(NULL, vo);
     *vo = (struct vo) {
         .log = mp_log_new(vo, log, name),
-        .driver = desc.p,
+        .driver = driver,
+        .caps = driver->caps,
         .global = global,
         .encode_lavc_ctx = ex->encode_lavc_ctx,
         .input_ctx = ex->input_ctx,
@@ -573,13 +575,13 @@ static void check_vo_caps(struct vo *vo)
 {
     int rot = vo->params->rotate;
     if (rot) {
-        bool ok = rot % 90 ? false : (vo->driver->caps & VO_CAP_ROTATE90);
+        bool ok = rot % 90 ? false : (vo->caps & VO_CAP_ROTATE90);
         if (!ok) {
            MP_WARN(vo, "Video is flagged as rotated by %d degrees, but the "
                    "video output does not support this.\n", rot);
         }
     }
-    if (vo->params->vflip && !(vo->driver->caps & VO_CAP_VFLIP))
+    if (vo->params->vflip && !(vo->caps & VO_CAP_VFLIP))
         MP_WARN(vo, "Video is flagged as vertically flipped, but the "
                     "video output does not support this.\n");
 }
@@ -956,7 +958,7 @@ static bool render_frame(struct vo *vo)
     in->dropped_frame = duration >= 0 && end_time < now;
 
     in->dropped_frame &= !frame->display_synced;
-    in->dropped_frame &= !(vo->driver->caps & VO_CAP_FRAMEDROP);
+    in->dropped_frame &= !(vo->caps & VO_CAP_FRAMEDROP);
     in->dropped_frame &= frame->can_drop;
     // Even if we're hopelessly behind, rather degrade to 10 FPS playback,
     // instead of just freezing the display forever.
@@ -1038,7 +1040,7 @@ static bool render_frame(struct vo *vo)
         update_vsync_timing_after_swap(vo, &vsync);
     }
 
-    if (vo->driver->caps & VO_CAP_NORETAIN) {
+    if (vo->caps & VO_CAP_NORETAIN) {
         talloc_free(in->current_frame);
         in->current_frame = NULL;
     }
@@ -1066,7 +1068,7 @@ static bool render_frame(struct vo *vo)
     mp_cond_broadcast(&in->wakeup); // for vo_wait_frame()
 
 done:
-    if (!(vo->driver->caps & VO_CAP_FRAMEOWNER) || in->dropped_frame)
+    if (!(vo->caps & VO_CAP_FRAMEOWNER) || in->dropped_frame)
         talloc_free(frame);
     mp_mutex_unlock(&in->lock);
 
@@ -1083,7 +1085,7 @@ static void do_redraw(struct vo *vo)
     mp_mutex_lock(&in->lock);
     in->request_redraw = false;
 
-    if (vo->driver->caps & (VO_CAP_NORETAIN | VO_CAP_UNTIMED)) {
+    if (vo->caps & (VO_CAP_NORETAIN | VO_CAP_UNTIMED)) {
         mp_mutex_unlock(&in->lock);
         return;
     }
@@ -1105,7 +1107,7 @@ static void do_redraw(struct vo *vo)
     vo->driver->draw_frame(vo, frame);
     vo->driver->flip_page(vo);
 
-    if (frame != &dummy && !(vo->driver->caps & VO_CAP_FRAMEOWNER))
+    if (frame != &dummy && !(vo->caps & VO_CAP_FRAMEOWNER))
         talloc_free(frame);
 }
 
@@ -1325,7 +1327,7 @@ void vo_get_src_dst_rects(struct vo *vo, struct mp_rect *out_src,
         *out_osd = (struct mp_osd_res){0};
         return;
     }
-    mp_get_src_dst_rects(vo->log, vo->opts, vo->driver->caps, vo->params,
+    mp_get_src_dst_rects(vo->log, vo->opts, vo->caps, vo->params,
                          vo->dwidth, vo->dheight, vo->monitor_par,
                          out_src, out_dst, out_osd);
 }

@@ -42,48 +42,73 @@ static const struct native_resource_entry native_resource_map[] = {
     },
 };
 
-static int init(struct render_backend *ctx, mpv_render_param *params)
+int libmpv_gpu_context_create(struct render_backend *backend,
+                              mpv_render_param *params, void *parent,
+                              struct libmpv_gpu_context **out)
 {
-    ctx->priv = talloc_zero(NULL, struct priv);
-    struct priv *p = ctx->priv;
-
+    *out = NULL;
     char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
     if (!api)
         return MPV_ERROR_INVALID_PARAMETER;
 
     for (int n = 0; context_backends[n]; n++) {
-        const struct libmpv_gpu_context_fns *backend = context_backends[n];
-        if (strcmp(backend->api_name, api) == 0) {
-            p->context = talloc_zero(NULL, struct libmpv_gpu_context);
-            *p->context = (struct libmpv_gpu_context){
-                .global = ctx->global,
-                .log = ctx->log,
-                .fns = backend,
-            };
-            break;
-        }
+        const struct libmpv_gpu_context_fns *fns = context_backends[n];
+        if (strcmp(fns->api_name, api) != 0)
+            continue;
+        *out = talloc_zero(NULL, struct libmpv_gpu_context);
+        **out = (struct libmpv_gpu_context) {
+            .global = backend->global,
+            .log = backend->log,
+            .fns = fns,
+        };
+        break;
     }
 
-    if (!p->context)
+    if (!*out)
         return MPV_ERROR_NOT_IMPLEMENTED;
 
-    int err = p->context->fns->init(p->context, params);
+    int err = (*out)->fns->init(*out, params);
     if (err < 0)
         return err;
 
     for (int n = 0; params && params[n].type; n++) {
-        if (params[n].type > 0 &&
-            params[n].type < MP_ARRAY_SIZE(native_resource_map) &&
-            native_resource_map[params[n].type].name)
-        {
-            const struct native_resource_entry *entry =
-                &native_resource_map[params[n].type];
-            void *data = params[n].data;
-            if (entry->size)
-                data = talloc_memdup(p, data, entry->size);
-            ra_add_native_resource(p->context->ra_ctx->ra, entry->name, data);
-        }
+        if (params[n].type <= 0 ||
+            params[n].type >= MP_ARRAY_SIZE(native_resource_map) ||
+            !native_resource_map[params[n].type].name)
+            continue;
+
+        const struct native_resource_entry *entry =
+            &native_resource_map[params[n].type];
+        void *data = params[n].data;
+        if (entry->size)
+            data = talloc_memdup(parent, data, entry->size);
+        ra_add_native_resource((*out)->ra_ctx->ra, entry->name, data);
     }
+
+    return 0;
+}
+
+void libmpv_gpu_context_destroy(struct libmpv_gpu_context **context)
+{
+    struct libmpv_gpu_context *ctx = *context;
+    if (!ctx)
+        return;
+    if (ctx->priv) {
+        ctx->fns->destroy(ctx);
+        talloc_free(ctx->priv);
+    }
+    talloc_free(ctx);
+    *context = NULL;
+}
+
+static int init(struct render_backend *ctx, mpv_render_param *params)
+{
+    ctx->priv = talloc_zero(NULL, struct priv);
+    struct priv *p = ctx->priv;
+
+    int err = libmpv_gpu_context_create(ctx, params, p, &p->context);
+    if (err < 0)
+        return err;
 
     p->renderer = gl_video_init(p->context->ra_ctx->ra, ctx->log, ctx->global);
 
@@ -226,11 +251,7 @@ static void destroy(struct render_backend *ctx)
 
     hwdec_devices_destroy(ctx->hwdec_devs);
 
-    if (p->context) {
-        p->context->fns->destroy(p->context);
-        talloc_free(p->context->priv);
-        talloc_free(p->context);
-    }
+    libmpv_gpu_context_destroy(&p->context);
 }
 
 const struct render_backend_fns render_backend_gpu = {

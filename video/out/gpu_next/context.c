@@ -106,6 +106,29 @@ err_out:
 }
 #endif // HAVE_D3D11
 
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+static bool gl_pl_init(struct gpu_ctx *ctx, bool debug, bool allow_sw)
+{
+    struct GL *gl = ra_gl_get(ctx->ra_ctx->ra);
+    struct pl_opengl_params params = *pl_opengl_params(
+        .debug = debug,
+        .allow_software = allow_sw,
+        .get_proc_addr_ex = (void *) gl->get_fn,
+        .proc_ctx = gl->fn_ctx,
+    );
+#if HAVE_EGL
+    params.egl_display = eglGetCurrentDisplay();
+    params.egl_context = eglGetCurrentContext();
+#endif
+    pl_opengl opengl = pl_opengl_create(ctx->pllog, &params);
+    if (!opengl)
+        return false;
+    ctx->gpu = opengl->gpu;
+    mppl_log_set_probing(ctx->pllog, false);
+    return true;
+}
+#endif
+
 struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts)
 {
     struct gpu_ctx *ctx = talloc_zero(NULL, struct gpu_ctx);
@@ -113,6 +136,7 @@ struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts)
     ctx->ra_ctx = ra_ctx_create(vo, *ctx_opts);
     if (!ctx->ra_ctx)
         goto err_out;
+    ctx->owns_ra_ctx = true;
 
 #if HAVE_VULKAN
     struct mpvk_ctx *vkctx = ra_vk_ctx_get(ctx->ra_ctx);
@@ -142,24 +166,11 @@ struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts)
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     if (ra_is_gl(ctx->ra_ctx->ra)) {
         struct GL *gl = ra_gl_get(ctx->ra_ctx->ra);
-        struct pl_opengl_params params = *pl_opengl_params(
-            .debug = ctx_opts->debug,
-            .allow_software = ctx_opts->allow_sw,
-            .get_proc_addr_ex = (void *) gl->get_fn,
-            .proc_ctx = gl->fn_ctx,
-        );
-# if HAVE_EGL
-        params.egl_display = eglGetCurrentDisplay();
-        params.egl_context = eglGetCurrentContext();
-# endif
-        pl_opengl opengl = pl_opengl_create(ctx->pllog, &params);
-        if (!opengl)
+        if (!gl_pl_init(ctx, ctx_opts->debug, ctx_opts->allow_sw))
             goto err_out;
-        ctx->gpu = opengl->gpu;
 
-        mppl_log_set_probing(ctx->pllog, false);
-
-        ctx->swapchain = pl_opengl_create_swapchain(opengl, pl_opengl_swapchain_params(
+        ctx->swapchain = pl_opengl_create_swapchain(pl_opengl_get(ctx->gpu),
+            pl_opengl_swapchain_params(
             .max_swapchain_depth = vo->opts->swapchain_depth,
             .framebuffer.flipped = gl->flipped,
         ));
@@ -180,6 +191,32 @@ err_out:
     return NULL;
 }
 
+struct gpu_ctx *gpu_ctx_create_from_ra(struct ra_ctx *ra_ctx, bool probing)
+{
+    struct gpu_ctx *ctx = talloc_zero(NULL, struct gpu_ctx);
+    ctx->log = ra_ctx->log;
+    ctx->ra_ctx = ra_ctx;
+    ctx->pllog = mppl_log_create(ctx, ctx->log);
+    if (!ctx->pllog)
+        goto error;
+
+    mppl_log_set_probing(ctx->pllog, probing);
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+    if (ra_is_gl(ra_ctx->ra) &&
+        gl_pl_init(ctx, ra_ctx->opts.debug, ra_ctx->opts.allow_sw))
+        return ctx;
+#elif HAVE_GL
+    if (ra_is_gl(ra_ctx->ra)) {
+        MP_MSG(ctx, probing ? MSGL_V : MSGL_ERR,
+               "libplacebo was built without OpenGL support.\n");
+    }
+#endif
+
+error:
+    gpu_ctx_destroy(&ctx);
+    return NULL;
+}
+
 bool gpu_ctx_resize(struct gpu_ctx *ctx, int w, int h)
 {
 #if HAVE_VULKAN
@@ -189,6 +226,21 @@ bool gpu_ctx_resize(struct gpu_ctx *ctx, int w, int h)
 #endif
 
     return pl_swapchain_resize(ctx->swapchain, &w, &h);
+}
+
+pl_tex gpu_ctx_wrap_opengl_fbo(struct gpu_ctx *ctx, unsigned int fbo,
+                               int w, int h)
+{
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+    if (ra_is_gl(ctx->ra_ctx->ra) && pl_opengl_get(ctx->gpu)) {
+        return pl_opengl_wrap(ctx->gpu, pl_opengl_wrap_params(
+            .framebuffer = fbo,
+            .width = w,
+            .height = h,
+        ));
+    }
+#endif
+    return NULL;
 }
 
 void gpu_ctx_destroy(struct gpu_ctx **ctxp)
@@ -229,7 +281,8 @@ void gpu_ctx_destroy(struct gpu_ctx **ctxp)
         pl_log_destroy(&ctx->pllog);
 
 skip_common_pl_cleanup:
-    ra_ctx_destroy(&ctx->ra_ctx);
+    if (ctx->owns_ra_ctx)
+        ra_ctx_destroy(&ctx->ra_ctx);
 
     talloc_free(ctx);
     *ctxp = NULL;

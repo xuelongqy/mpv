@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <stdbool.h>
+
 #include <libplacebo/renderer.h>
 
 struct mp_log;
@@ -27,6 +29,7 @@ struct vo;
 struct gpu_ctx {
     struct mp_log *log;
     struct ra_ctx *ra_ctx;
+    bool owns_ra_ctx;
 
     pl_log pllog;
     pl_gpu gpu;
@@ -36,5 +39,8 @@ struct gpu_ctx {
 };
 
 struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts);
+struct gpu_ctx *gpu_ctx_create_from_ra(struct ra_ctx *ra_ctx, bool probing);
 bool gpu_ctx_resize(struct gpu_ctx *ctx, int w, int h);
+pl_tex gpu_ctx_wrap_opengl_fbo(struct gpu_ctx *ctx, unsigned int fbo,
+                               int w, int h);
 void gpu_ctx_destroy(struct gpu_ctx **ctxp);
