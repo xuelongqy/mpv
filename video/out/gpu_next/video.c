@@ -1392,30 +1392,12 @@ void gpu_next_renderer_prepare(struct gpu_next_renderer *p,
                                struct gpu_next_target *target,
                                struct mp_image_params *hint_params)
 {
-    pl_options pars = p->pars;
     update_options(p);
 
-    struct pl_render_params params = pars->params;
     const struct gl_video_opts *opts = p->opts_cache->opts;
     if (opts->hdr_reference_white)
         reference_luminance = opts->hdr_reference_white;
-    bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
-    bool cache_frame = will_redraw || frame->still || p->paused;
     bool interpolate = can_interpolate(p, frame);
-    params.info_callback = info_callback;
-    params.info_priv = p;
-    params.skip_caching_single_frame = !cache_frame;
-    params.preserve_mixing_cache = p->next_opts->inter_preserve && !frame->still;
-    if (frame->still || p->paused)
-        params.frame_mixer = NULL;
-
-    if (frame->current && frame->current->params.vflip) {
-        pl_matrix2x2 m = { .m = {{1, 0}, {0, -1}}, };
-        pars->distort_params.transform.mat = m;
-        params.distort_params = &pars->distort_params;
-    } else {
-        params.distort_params = NULL;
-    }
 
     enqueue_frames(p, frame, interpolate);
 
