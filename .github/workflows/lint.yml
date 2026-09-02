@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - ci
+      - ci-opengl-v1-upstream
       - 'release/**'
   pull_request:
     branches: [master]
