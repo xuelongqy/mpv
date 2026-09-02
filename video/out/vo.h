@@ -462,6 +462,9 @@ struct vo_driver {
 
 struct vo {
     const struct vo_driver *driver;
+    // VO_CAP_* bits, initialized from the driver and optionally extended by
+    // the driver during preinit.
+    int caps;
     struct mp_log *log; // Using e.g. "[vo/vdpau]" as prefix
     void *priv;
     struct mpv_global *global;

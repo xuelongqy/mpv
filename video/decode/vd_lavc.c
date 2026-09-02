@@ -840,7 +840,7 @@ static void init_avctx(struct mp_filter *vd)
         break;
     case 1: /*GPU*/
         if (!ctx->vo ||
-            (ctx->vo && !(ctx->vo->driver->caps & VO_CAP_FILM_GRAIN))) {
+            (ctx->vo && !(ctx->vo->caps & VO_CAP_FILM_GRAIN))) {
             MP_MSG(vd, ctx->vo ? MSGL_WARN : MSGL_V,
                    "GPU film grain requested, but VO %s, expect wrong output.\n",
                    ctx->vo ?
@@ -851,7 +851,7 @@ static void init_avctx(struct mp_filter *vd)
         avctx->export_side_data |= AV_CODEC_EXPORT_DATA_FILM_GRAIN;
         break;
     default:
-        if (ctx->vo && (ctx->vo->driver->caps & VO_CAP_FILM_GRAIN))
+        if (ctx->vo && (ctx->vo->caps & VO_CAP_FILM_GRAIN))
             avctx->export_side_data |= AV_CODEC_EXPORT_DATA_FILM_GRAIN;
 
         break;
