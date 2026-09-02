@@ -105,7 +105,7 @@ void vo_calc_window_geometry(struct vo *vo, struct mp_vo_opts *opts,
 
     int d_w, d_h;
     mp_image_params_get_dsize(&params, &d_w, &d_h);
-    if ((vo->driver->caps & VO_CAP_ROTATE90) && params.rotate % 180 == 90)
+    if ((vo->caps & VO_CAP_ROTATE90) && params.rotate % 180 == 90)
         MPSWAP(int, d_w, d_h);
     d_w = MPCLAMP(d_w * opts->window_scale * dpi_scale, 1, 16000);
     d_h = MPCLAMP(d_h * opts->window_scale * dpi_scale, 1, 16000);

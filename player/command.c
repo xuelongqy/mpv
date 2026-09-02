@@ -2815,7 +2815,7 @@ static int mp_property_current_window_scale(void *ctx, struct m_property *prop,
     if (vid_w < 1 || vid_h < 1)
         return M_PROPERTY_UNAVAILABLE;
 
-    if (params.rotate % 180 == 90 && (vo->driver->caps & VO_CAP_ROTATE90))
+    if (params.rotate % 180 == 90 && (vo->caps & VO_CAP_ROTATE90))
         MPSWAP(int, vid_w, vid_h);
 
     if (vo->monitor_par < 1) {

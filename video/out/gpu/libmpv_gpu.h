@@ -38,3 +38,8 @@ struct libmpv_gpu_context_fns {
 };
 
 extern const struct libmpv_gpu_context_fns libmpv_gpu_context_gl;
+
+int libmpv_gpu_context_create(struct render_backend *backend,
+                              mpv_render_param *params, void *parent,
+                              struct libmpv_gpu_context **out);
+void libmpv_gpu_context_destroy(struct libmpv_gpu_context **context);

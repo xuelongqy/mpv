@@ -395,8 +395,8 @@ void mp_output_chain_set_vo(struct mp_output_chain *c, struct vo *vo)
 
     p->stream_info.hwdec_devs = vo ? vo->hwdec_devs : NULL;
     p->stream_info.osd = vo ? vo->osd : NULL;
-    p->stream_info.vflip = vo ? vo->driver->caps & VO_CAP_VFLIP : false;
-    p->stream_info.rotate90 = vo ? vo->driver->caps & VO_CAP_ROTATE90 : false;
+    p->stream_info.vflip = vo ? vo->caps & VO_CAP_VFLIP : false;
+    p->stream_info.rotate90 = vo ? vo->caps & VO_CAP_ROTATE90 : false;
     p->stream_info.dr_vo = vo;
     p->vo = vo;
     update_output_caps(p);

@@ -113,6 +113,7 @@ struct mpv_render_context {
 
 const struct render_backend_fns *render_backends[] = {
     &render_backend_gpu,
+    &render_backend_gpu_next,
     &render_backend_sw,
     NULL
 };
@@ -184,8 +185,34 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
     if (GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_ADVANCED_CONTROL, int, 0))
         ctx->advanced_control = true;
 
+    const struct render_backend_fns *selected = NULL;
+    bool selector_present = false;
+    char *selector = NULL;
+    for (int n = 0; params && params[n].type; n++) {
+        if (params[n].type == MPV_RENDER_PARAM_RENDERER) {
+            selector_present = true;
+            selector = params[n].data;
+            break;
+        }
+    }
+    if (selector_present) {
+        if (!selector || !selector[0]) {
+            mpv_render_context_free(ctx);
+            return MPV_ERROR_INVALID_PARAMETER;
+        } else if (strcmp(selector, "gpu") == 0) {
+            selected = &render_backend_gpu;
+        } else if (strcmp(selector, "gpu-next") == 0) {
+            selected = &render_backend_gpu_next;
+        } else {
+            mpv_render_context_free(ctx);
+            return MPV_ERROR_INVALID_PARAMETER;
+        }
+    }
+
     int err = MPV_ERROR_NOT_IMPLEMENTED;
     for (int n = 0; render_backends[n]; n++) {
+        if (selected && render_backends[n] != selected)
+            continue;
         ctx->renderer = talloc_zero(NULL, struct render_backend);
         *ctx->renderer = (struct render_backend){
             .global = ctx->global,
@@ -728,6 +755,8 @@ static int preinit(struct vo *vo)
             MP_FATAL(vo, "No render context set.\n");
         return -1;
     }
+
+    vo->caps |= ctx->renderer->driver_caps;
 
     mp_mutex_lock(&ctx->lock);
     ctx->vo = vo;

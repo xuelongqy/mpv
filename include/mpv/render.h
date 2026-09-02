@@ -422,6 +422,28 @@ typedef enum mpv_render_param_type {
      * See MPV_RENDER_PARAM_SW_STRIDE for alignment requirements.
      */
     MPV_RENDER_PARAM_SW_POINTER = 20,
+    /**
+     * Select the video renderer. Valid only for mpv_render_context_create().
+     * Type: char*
+     *
+     * Supported values:
+     *  "gpu"
+     *      Select the legacy GPU renderer.
+     *  "gpu-next"
+     *      Select the libplacebo GPU renderer.
+     *
+     * If omitted, the renderer is selected as before based on the API type.
+     * An unknown value returns MPV_ERROR_INVALID_PARAMETER. If the selected
+     * renderer does not support the requested API type,
+     * MPV_ERROR_NOT_IMPLEMENTED is returned. Applications should check
+     * mpv_client_api_version() before using this parameter.
+     *
+     * The OpenGL gpu-next backend treats the target as an SDR monitor unless
+     * mpv target color options override it. For HDR output, set target-prim
+     * and target-trc as appropriate, and configure the framebuffer and window
+     * system for the matching HDR colorspace.
+     */
+    MPV_RENDER_PARAM_RENDERER = 21,
 } mpv_render_param_type;
 
 /**
