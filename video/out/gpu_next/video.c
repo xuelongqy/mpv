@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include <libavutil/buffer.h>
 #include <libplacebo/colorspace.h>
 #include <libplacebo/options.h>
 #include <libplacebo/renderer.h>
@@ -105,12 +106,11 @@ struct cache {
     pl_cache cache;
 };
 
-// Mapping state of a single hwdec frame.
+// Mapping state of a single hwdec frame, kept alive by mapper->src.
 struct hwdec_slot {
     struct ra_hwdec_mapper *mapper;
     struct timer_pool *timer;
     struct mp_pass_perf perf;
-    struct mp_image *owner;   // queue entry image that owns the mapping
     bool acquired;            // between acquire and release of a render pass
     pl_tex tex[4];            // plane textures of the current mapping
 };
@@ -678,7 +678,6 @@ static void slot_unmap(struct gpu_next_renderer *p, struct hwdec_slot *s)
     }
     memset(s->tex, 0, sizeof(s->tex));
     ra_hwdec_mapper_unmap(s->mapper);
-    s->owner = NULL;
 }
 
 static bool slot_reconfig(struct gpu_next_renderer *p, struct hwdec_slot *s,
@@ -709,13 +708,14 @@ static bool slot_reconfig(struct gpu_next_renderer *p, struct hwdec_slot *s,
     return true;
 }
 
-// The queue dropped this entry. Release the mapping if the entry owns it.
-static void slot_release_owner(struct gpu_next_renderer *p,
-                               struct hwdec_slot *s,
-                               struct mp_image *owner)
+static void unmap_unused_hwdec(struct gpu_next_renderer *p, struct mp_image *image)
 {
-    if (s->owner == owner)
-        slot_unmap(p, s);
+    if (!image || !ra_hwdec_get(&p->hwdec_ctx, image->imgfmt))
+        slot_unmap(p, &p->hwdec);
+
+    struct mp_image *el = image ? image->enhancement_layer : NULL;
+    if (!el || !ra_hwdec_get(&p->hwdec_ctx, el->imgfmt))
+        slot_unmap(p, &p->el_hwdec);
 }
 
 static void slot_uninit(struct gpu_next_renderer *p, struct hwdec_slot *s)
@@ -790,14 +790,34 @@ static void setup_hwdec_plane_mapping(struct pl_frame *frame,
     }
 }
 
+static bool same_buffer(const AVBufferRef *a, const AVBufferRef *b)
+{
+    if (!a || !b)
+        return a == b;
+    return a->buffer == b->buffer && a->data == b->data && a->size == b->size;
+}
+
+static bool same_hwdec_frame(const struct mp_image *a, const struct mp_image *b)
+{
+    if (!a || !b || !a->bufs[0] || !b->bufs[0] || a->imgfmt != b->imgfmt ||
+        !same_buffer(a->hwctx, b->hwctx))
+        return false;
+
+    for (int n = 0; n < MP_MAX_PLANES; n++) {
+        if (!same_buffer(a->bufs[n], b->bufs[n]) ||
+            a->planes[n] != b->planes[n] || a->stride[n] != b->stride[n])
+            return false;
+    }
+    return true;
+}
+
 static bool slot_acquire(struct gpu_next_renderer *p, struct hwdec_slot *s,
-                         struct mp_image *owner, struct mp_image *mpi,
+                         struct mp_image *mpi,
                          struct pl_frame *frame)
 {
-    if (s->owner != owner) {
-        // With one frame per role acquired at a time the previous owner is
-        // not in use and can be evicted. Interlaced sources would break this
-        // (prev and next are acquired alongside the image), see hwdec_slot.
+    // A screenshot queue can hold a different reference to the same frame.
+    // Some hardware decoders cannot map a consumed output buffer twice.
+    if (!same_hwdec_frame(s->mapper->src, mpi)) {
         if (s->acquired) {
             MP_ERR(p, "Hardware frame of this role is still in use.\n");
             return false;
@@ -814,7 +834,6 @@ static bool slot_acquire(struct gpu_next_renderer *p, struct hwdec_slot *s,
             return false;
         }
         s->perf = timer_pool_measure(s->timer);
-        s->owner = owner;
     }
 
     if (ra_hwdec_mapper_begin_access(s->mapper) < 0)
@@ -848,7 +867,7 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
     struct frame_priv *fp = mpi->priv;
     struct gpu_next_renderer *p = fp->renderer;
     return slot_reconfig(p, &p->hwdec, fp->hwdec, &mpi->params) &&
-           slot_acquire(p, &p->hwdec, mpi, mpi, frame);
+           slot_acquire(p, &p->hwdec, mpi, frame);
 }
 
 static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
@@ -866,9 +885,8 @@ static bool hwdec_acquire_el(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *el_mpi = bl_mpi->enhancement_layer;
     struct frame_priv *fp = bl_mpi->priv;
     struct gpu_next_renderer *p = fp->renderer;
-    // The EL image belongs to the BL queue entry, which therefore owns the slot.
     return slot_reconfig(p, &p->el_hwdec, fp->el_hwdec, &el_mpi->params) &&
-           slot_acquire(p, &p->el_hwdec, bl_mpi, el_mpi, frame);
+           slot_acquire(p, &p->el_hwdec, el_mpi, frame);
 }
 
 static void hwdec_release_el(pl_gpu gpu, struct pl_frame *frame)
@@ -1162,8 +1180,6 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
         if (fp->el_tex[i])
             pl_tex_destroy(gpu, &fp->el_tex[i]);
     }
-    slot_release_owner(p, &p->hwdec, mpi);
-    slot_release_owner(p, &p->el_hwdec, mpi);
     talloc_free(mpi);
 }
 
@@ -1437,6 +1453,7 @@ void gpu_next_renderer_prepare(struct gpu_next_renderer *p,
                                struct mp_image_params *hint_params)
 {
     update_options(p);
+    unmap_unused_hwdec(p, frame->current);
 
     const struct gl_video_opts *opts = p->opts_cache->opts;
     if (opts->hdr_reference_white)
@@ -1593,6 +1610,7 @@ void gpu_next_renderer_prepare(struct gpu_next_renderer *p,
 void gpu_next_renderer_skip_frame(struct gpu_next_renderer *p,
                                   struct vo_frame *frame)
 {
+    unmap_unused_hwdec(p, frame->current);
     bool interpolate = can_interpolate(p, frame);
     double pts_offset = interpolate ? frame->ideal_frame_vsync : 0;
     struct pl_render_params params = p->pars->params;
@@ -1873,6 +1891,7 @@ void gpu_next_renderer_screenshot(struct gpu_next_renderer *p,
 
     update_options(p);
     if (frame && frame->current) {
+        unmap_unused_hwdec(p, frame->current);
         screenshot_queue = pl_queue_create(gpu);
         if (!screenshot_queue) {
             MP_ERR(p, "Failed creating frame queue for screenshot!\n");
