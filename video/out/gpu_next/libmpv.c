@@ -1,5 +1,6 @@
 #include <libplacebo/config.h>
 
+#include "config.h"
 #include "common/common.h"
 #include "mpv/render_gl.h"
 #include "sub/osd.h"
@@ -8,11 +9,17 @@
 #include "video/out/gpu/libmpv_gpu.h"
 #include "video/out/gpu_next/video.h"
 #include "video/out/libmpv.h"
+#if HAVE_VULKAN
+#include "libmpv_vk.h"
+#endif
 
 struct priv {
     struct libmpv_gpu_context *context;
     struct gpu_ctx *gpu;
     struct gpu_next_renderer *renderer;
+#if HAVE_VULKAN
+    struct libmpv_vk *vk;
+#endif
 };
 
 static int init(struct render_backend *ctx, mpv_render_param *params)
@@ -20,25 +27,39 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     ctx->priv = talloc_zero(NULL, struct priv);
     struct priv *p = ctx->priv;
 
-    int err = libmpv_gpu_context_create(ctx, params, p, &p->context);
-    if (err < 0)
-        return err;
+    const char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
+    if (!api)
+        return MPV_ERROR_INVALID_PARAMETER;
+    bool vulkan = !strcmp(api, MPV_RENDER_API_TYPE_VULKAN);
+    if (vulkan) {
+#if HAVE_VULKAN
+        int err = libmpv_vk_create(ctx, params, &p->vk, &p->gpu);
+        if (err < 0)
+            return err;
+#else
+        return MPV_ERROR_NOT_IMPLEMENTED;
+#endif
+    } else {
+        int err = libmpv_gpu_context_create(ctx, params, p, &p->context);
+        if (err < 0)
+            return err;
 
 #if !defined(PL_HAVE_OPENGL)
-    return MPV_ERROR_NOT_IMPLEMENTED;
+        return MPV_ERROR_NOT_IMPLEMENTED;
 #endif
 
-    p->gpu = gpu_ctx_create_from_ra(p->context->ra_ctx, false);
-    if (!p->gpu)
-        return MPV_ERROR_UNSUPPORTED;
+        p->gpu = gpu_ctx_create_from_ra(p->context->ra_ctx, false);
+        if (!p->gpu)
+            return MPV_ERROR_UNSUPPORTED;
+    }
 
     ctx->hwdec_devs = hwdec_devices_create();
     p->renderer = gpu_next_renderer_create(p, ctx->global, ctx->log,
-                                           p->gpu, ctx->hwdec_devs, true);
+                                           p->gpu, ctx->hwdec_devs, !vulkan);
     if (!p->renderer)
         return MPV_ERROR_UNSUPPORTED;
 
-    p->context->ra_ctx->opts.want_alpha =
+    p->gpu->ra_ctx->opts.want_alpha =
         gpu_next_renderer_want_alpha(p->renderer);
     ctx->driver_caps = VO_CAP_ROTATE90 | VO_CAP_FILM_GRAIN | VO_CAP_VFLIP;
     return 0;
@@ -53,6 +74,10 @@ static bool check_format(struct render_backend *ctx, int imgfmt)
 static int set_parameter(struct render_backend *ctx, mpv_render_param param)
 {
     struct priv *p = ctx->priv;
+#if HAVE_VULKAN
+    if (p->vk && param.type == MPV_RENDER_PARAM_VULKAN_RETIRE_TARGET)
+        return libmpv_vk_retire(p->vk, param.data);
+#endif
     if (param.type != MPV_RENDER_PARAM_ICC_PROFILE)
         return MPV_ERROR_NOT_IMPLEMENTED;
     if (!param.data)
@@ -86,7 +111,7 @@ static void update_external(struct render_backend *ctx, struct vo *vo)
         return;
 
     gpu_next_renderer_update_options(p->renderer);
-    p->context->ra_ctx->opts.want_alpha =
+    p->gpu->ra_ctx->opts.want_alpha =
         gpu_next_renderer_want_alpha(p->renderer);
     int req_frames, max_frames;
     gpu_next_renderer_get_queue_params(p->renderer, &req_frames, &max_frames);
@@ -103,6 +128,11 @@ static void resize(struct render_backend *ctx, struct mp_rect *src,
 static int get_target_size(struct render_backend *ctx, mpv_render_param *params,
                            int *out_w, int *out_h)
 {
+#if HAVE_VULKAN
+    struct priv *p = ctx->priv;
+    if (p->vk)
+        return libmpv_vk_get_target_size(p->vk, params, out_w, out_h);
+#endif
     mpv_opengl_fbo *fbo = get_mpv_render_param(
         params, MPV_RENDER_PARAM_OPENGL_FBO, NULL);
     if (!fbo)
@@ -124,6 +154,22 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         params, MPV_RENDER_PARAM_DEPTH, int, 8);
     if (target.dither_depth <= 0)
         target.dither_depth = 8;
+
+#if HAVE_VULKAN
+    if (p->vk) {
+        struct pl_frame target_frame;
+        int err = libmpv_vk_start_frame(p->vk, params, &target_frame);
+        if (err < 0) {
+            gpu_next_renderer_skip_frame(p->renderer, frame);
+            return err;
+        }
+        struct gpu_next_render_result result;
+        bool ok = gpu_next_renderer_render(p->renderer, frame, &target_frame,
+                                           &target, &result);
+        err = libmpv_vk_end_frame(p->vk, params);
+        return err < 0 ? err : ok ? 0 : MPV_ERROR_GENERIC;
+    }
+#endif
 
     mpv_opengl_fbo *fbo = get_mpv_render_param(
         params, MPV_RENDER_PARAM_OPENGL_FBO, NULL);
@@ -204,7 +250,12 @@ static void destroy(struct render_backend *ctx)
     gpu_next_renderer_destroy(&p->renderer);
     hwdec_devices_destroy(ctx->hwdec_devs);
     ctx->hwdec_devs = NULL;
-    gpu_ctx_destroy(&p->gpu);
+#if HAVE_VULKAN
+    if (p->vk)
+        libmpv_vk_destroy(&p->vk);
+    else
+#endif
+        gpu_ctx_destroy(&p->gpu);
     libmpv_gpu_context_destroy(&p->context);
 }
 

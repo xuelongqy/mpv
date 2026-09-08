@@ -10,11 +10,12 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <mpv/client.h>
 #include <mpv/render.h>
 
-static void check_create(const char *renderer, bool include_renderer,
+static void check_create(const char *api, const char *renderer, bool include_renderer,
                          int expected)
 {
     mpv_handle *mpv = mpv_create();
@@ -25,9 +26,8 @@ static void check_create(const char *renderer, bool include_renderer,
         mpv_initialize(mpv) < 0)
         exit(1);
 
-    char api[] = MPV_RENDER_API_TYPE_SW;
     mpv_render_param params[] = {
-        {MPV_RENDER_PARAM_API_TYPE, api},
+        {MPV_RENDER_PARAM_API_TYPE, (void *)api},
         {include_renderer ? MPV_RENDER_PARAM_RENDERER : 0, (void *)renderer},
         {0},
     };
@@ -43,13 +43,20 @@ static void check_create(const char *renderer, bool include_renderer,
     mpv_terminate_destroy(mpv);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    check_create(NULL, false, 0);
-    check_create("gpu", true, MPV_ERROR_NOT_IMPLEMENTED);
-    check_create("gpu-next", true, MPV_ERROR_NOT_IMPLEMENTED);
-    check_create("unknown", true, MPV_ERROR_INVALID_PARAMETER);
-    check_create("", true, MPV_ERROR_INVALID_PARAMETER);
-    check_create(NULL, true, MPV_ERROR_INVALID_PARAMETER);
+    check_create(MPV_RENDER_API_TYPE_SW, NULL, false, 0);
+    check_create(MPV_RENDER_API_TYPE_SW, "gpu", true, MPV_ERROR_NOT_IMPLEMENTED);
+    check_create(MPV_RENDER_API_TYPE_SW, "gpu-next", true, MPV_ERROR_NOT_IMPLEMENTED);
+    check_create(MPV_RENDER_API_TYPE_SW, "unknown", true, MPV_ERROR_INVALID_PARAMETER);
+    check_create(MPV_RENDER_API_TYPE_SW, "", true, MPV_ERROR_INVALID_PARAMETER);
+    check_create(MPV_RENDER_API_TYPE_SW, NULL, true, MPV_ERROR_INVALID_PARAMETER);
+
+    bool vulkan = argc > 1 && strcmp(argv[1], "vulkan") == 0;
+    int missing_init = vulkan ? MPV_ERROR_INVALID_PARAMETER : MPV_ERROR_NOT_IMPLEMENTED;
+    check_create(MPV_RENDER_API_TYPE_VULKAN, NULL, false, missing_init);
+    check_create(MPV_RENDER_API_TYPE_VULKAN, "gpu-next", true, missing_init);
+    check_create(MPV_RENDER_API_TYPE_VULKAN, "gpu", true, MPV_ERROR_NOT_IMPLEMENTED);
+    check_create(MPV_RENDER_API_TYPE_VULKAN, "unknown", true, MPV_ERROR_INVALID_PARAMETER);
     return 0;
 }

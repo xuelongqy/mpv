@@ -444,6 +444,11 @@ typedef enum mpv_render_param_type {
      * system for the matching HDR colorspace.
      */
     MPV_RENDER_PARAM_RENDERER = 21,
+
+    /** Experimental Vulkan parameters. See the uninstalled render_vk.h draft. */
+    MPV_RENDER_PARAM_VULKAN_INIT_PARAMS = 22,
+    MPV_RENDER_PARAM_VULKAN_TARGET = 23,
+    MPV_RENDER_PARAM_VULKAN_RETIRE_TARGET = 24,
 } mpv_render_param_type;
 
 /**
@@ -490,6 +495,7 @@ typedef struct mpv_render_param {
 #define MPV_RENDER_API_TYPE_OPENGL "opengl"
 // See section "Software renderer"
 #define MPV_RENDER_API_TYPE_SW "sw"
+#define MPV_RENDER_API_TYPE_VULKAN "vulkan"
 
 /**
  * Flags used in mpv_render_frame_info.flags. Each value represents a bit in it.
