@@ -29,7 +29,7 @@
 /**
  * MPV_RENDER_PARAM_VULKAN_INIT_PARAMS, for context creation only.
  * Select API "vulkan" and renderer "gpu-next". No window or swapchain is
- * created by libmpv. Only software-decoded input and SDR output are validated.
+ * created by libmpv. Hardware-decoder interoperability is not validated.
  *
  * The caller owns all Vulkan handles. The instance and device must outlive
  * the render context. All Render API calls must be externally serialized,
@@ -88,8 +88,10 @@ typedef enum mpv_vulkan_target_state {
  * the common Render API can return without invoking the backend.
  *
  * image belongs to device from init. It is a bound, optimal-tiled, 2D color
- * image, one mip, one layer, VK_SAMPLE_COUNT_1_BIT. Only R8G8B8A8_UNORM and
- * B8G8R8A8_UNORM are supported. usage must match creation and include
+ * image, one mip, one layer, VK_SAMPLE_COUNT_1_BIT. Supported formats are
+ * R8G8B8A8_UNORM, B8G8R8A8_UNORM, A2B10G10R10_UNORM_PACK32,
+ * A2R10G10B10_UNORM_PACK32 and R16G16B16A16_SFLOAT.
+ * usage must match creation and include
  * COLOR_ATTACHMENT_BIT and TRANSFER_DST_BIT (background/error clears).
  * The caller must query support before creating images.
  * No multisampling, external memory import or ownership transfer is performed.
@@ -115,7 +117,15 @@ typedef enum mpv_vulkan_target_state {
  * SKIP_RENDERING ignores this parameter and does not touch synchronization.
  *
  * Targets default to SDR monitor/sRGB. FLIP_Y and DEPTH retain their existing
- * meanings (omitted/nonpositive depth is 8). HDR surfaces are not validated.
+ * meanings (omitted/nonpositive depth is 8, regardless of image format).
+ * A high-bit-depth format does not select HDR encoding. For PQ output, set
+ * target-prim=bt.2020, target-trc=pq, target-peak to the desired output peak,
+ * and DEPTH=10 for a 10-bit target. For floating-point scRGB output, use
+ * target-prim=bt.709, target-trc=scrgb and dither-depth=no. scRGB uses 1.0
+ * for 80 cd/m^2 and can contain negative values and values above 1.0.
+ * The caller must configure a matching surface colorspace and display-layer
+ * luminance interpretation. libmpv neither detects HDR display support nor
+ * configures window layers, swapchains or HDR metadata.
  */
 typedef struct mpv_vulkan_target {
     uint32_t version;

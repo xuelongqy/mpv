@@ -180,7 +180,10 @@ int libmpv_vk_get_target_size(struct libmpv_vk *p, mpv_render_param *params,
         !valid_layout(t->output_layout, t->usage, false))
         return MPV_ERROR_INVALID_PARAMETER;
     if ((t->format != VK_FORMAT_R8G8B8A8_UNORM &&
-         t->format != VK_FORMAT_B8G8R8A8_UNORM) ||
+         t->format != VK_FORMAT_B8G8R8A8_UNORM &&
+         t->format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+         t->format != VK_FORMAT_A2R10G10B10_UNORM_PACK32 &&
+         t->format != VK_FORMAT_R16G16B16A16_SFLOAT) ||
         t->width > p->context.gpu->limits.max_tex_2d_dim ||
         t->height > p->context.gpu->limits.max_tex_2d_dim)
         return MPV_ERROR_UNSUPPORTED;
@@ -243,6 +246,14 @@ int libmpv_vk_start_frame(struct libmpv_vk *p, mpv_render_param *params,
         .crop = {.x1 = w, .y1 = h},
     };
     frame->repr.alpha = alpha ? PL_ALPHA_INDEPENDENT : PL_ALPHA_NONE;
+    pl_fmt format = p->active->params.format;
+    if (format->type == PL_FMT_UNORM) {
+        int depth = 0;
+        for (int i = 0; i < 3; i++)
+            depth = MPMAX(depth, format->component_depth[i]);
+        frame->repr.bits.sample_depth = depth;
+        frame->repr.bits.color_depth = depth;
+    }
     return 0;
 }
 
