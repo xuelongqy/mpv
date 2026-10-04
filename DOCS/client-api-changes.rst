@@ -32,6 +32,11 @@ API changes
 
 ::
 
+ --- downstream experimental branch (not an upstream API release) ---
+ 2.7    - install the experimental Vulkan Render API header, render_vk.h
+        - add Vulkan device, target and retirement parameters (draft version 1)
+          Vulkan support remains optional; use matching headers and library.
+          Client API version alone does not identify future draft revisions.
  --- mpv 0.42.0 ---
  2.6    - add MPV_RENDER_PARAM_RENDERER
  --- mpv 0.40.0 ---

@@ -445,7 +445,7 @@ typedef enum mpv_render_param_type {
      */
     MPV_RENDER_PARAM_RENDERER = 21,
 
-    /** Experimental Vulkan parameters. See the uninstalled render_vk.h draft. */
+    /** Downstream experimental Vulkan parameters. See the render_vk.h draft. */
     MPV_RENDER_PARAM_VULKAN_INIT_PARAMS = 22,
     MPV_RENDER_PARAM_VULKAN_TARGET = 23,
     MPV_RENDER_PARAM_VULKAN_RETIRE_TARGET = 24,

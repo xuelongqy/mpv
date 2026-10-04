@@ -13,9 +13,11 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-/* Experimental Vulkan Render API draft. Not installed or ABI-stable.
- * This header must be used with the matching experimental libmpv build.
- * mpv_client_api_version() does not identify revisions of this draft.
+/* Downstream experimental Vulkan Render API draft, not ABI-stable.
+ * Use this installed header with the matching experimental libmpv build.
+ * Check mpv_client_api_version() >= MPV_MAKE_VERSION(2, 7) before use, then
+ * check context creation for backend availability. The client API version
+ * alone does not identify draft revisions or guarantee Vulkan support.
  */
 #ifndef MPV_CLIENT_API_RENDER_VK_H_
 #define MPV_CLIENT_API_RENDER_VK_H_
@@ -24,6 +26,8 @@
 #include <vulkan/vulkan.h>
 #include "render.h"
 
+// Incompatible structure or semantic changes must increment this version.
+// All versioned parameters reject values other than the supported version.
 #define MPV_VULKAN_DRAFT_VERSION 1
 
 /**
