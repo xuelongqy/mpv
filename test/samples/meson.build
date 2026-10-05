@@ -88,7 +88,8 @@ foreach name, cmd: samples
     )
     env = name.startswith('locale') ? 'LANG=C' : []
     testname = 'libmpv-test-' + name
-    exe = executable(testname, '../libmpv_test_track_selection.c',
+    exename = host_machine.system() == 'windows' ? testname.replace('.', '-') : testname
+    exe = executable(exename, '../libmpv_test_track_selection.c',
                      include_directories: incdir, dependencies: libmpv_dep)
     test(testname, exe, args: [name, target.full_path()],
          depends: target, env: env, suite: 'libmpv')
