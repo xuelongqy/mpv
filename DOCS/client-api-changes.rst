@@ -32,7 +32,13 @@ API changes
 
 ::
 
- --- downstream experimental branch (not an upstream API release) ---
+ --- downstream branch (not an upstream API release) ---
+ 2.8    - freeze the downstream Vulkan Render API v1 ABI and caller contract
+        - add MPV_VULKAN_API_VERSION=1; retain MPV_VULKAN_DRAFT_VERSION as an alias
+        - preserve the 2.7/draft 1 structure layouts, parameter numbers and behavior
+          Existing clients remain compatible. New clients check major 2/minor >= 8
+          and context creation; Vulkan support remains optional.
+          Future extensions retain v1 without changing its layout or requirements.
  2.7    - install the experimental Vulkan Render API header, render_vk.h
         - add Vulkan device, target and retirement parameters (draft version 1)
           Vulkan support remains optional; use matching headers and library.

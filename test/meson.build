@@ -159,6 +159,14 @@ if get_option('libmpv')
     test('libmpv-test-render-params', exe, suite: 'libmpv',
          args: features['vulkan'] ? 'vulkan' : 'no-vulkan')
 
+    if features['vulkan']
+        exe = executable('libmpv-test-render-vk-abi',
+                         'libmpv_test_render_vk_abi.c',
+                         include_directories: incdir_public,
+                         dependencies: vulkan)
+        test('libmpv-test-render-vk-abi', exe, suite: 'libmpv')
+    endif
+
     exe = executable('libmpv-test-lavfi-complex', 'libmpv_test_lavfi_complex.c',
                      include_directories: incdir, dependencies: libmpv_dep)
     test('libmpv-test-lavfi-complex', exe, args: file, suite: 'libmpv')

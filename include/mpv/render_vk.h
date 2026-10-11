@@ -13,11 +13,17 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-/* Downstream experimental Vulkan Render API draft, not ABI-stable.
- * Use this installed header with the matching experimental libmpv build.
- * Check mpv_client_api_version() >= MPV_MAKE_VERSION(2, 7) before use, then
- * check context creation for backend availability. The client API version
- * alone does not identify draft revisions or guarantee Vulkan support.
+/* Downstream Vulkan Render API v1, ABI-stable in this fork, not an upstream API.
+ * Before use, check mpv_client_api_version() for major 2 and minor >= 8, then
+ * create a "vulkan" / "gpu-next" context to check backend availability.
+ * The client API version alone does not guarantee Vulkan or device support.
+ *
+ * v1 preserves the layouts and semantics of the 2.7/draft 1 snapshot. Existing
+ * clients using that snapshot remain compatible. Structure sizes, alignment,
+ * field types/order and enum values are frozen for each supported platform's
+ * C ABI; they are not a portable serialized format. Future extensions must
+ * retain v1 support and use new parameters or explicitly versioned structures,
+ * never append fields to these structures or strengthen v1 device requirements.
  */
 #ifndef MPV_CLIENT_API_RENDER_VK_H_
 #define MPV_CLIENT_API_RENDER_VK_H_
@@ -26,14 +32,19 @@
 #include <vulkan/vulkan.h>
 #include "render.h"
 
-// Incompatible structure or semantic changes must increment this version.
-// All versioned parameters reject values other than the supported version.
-#define MPV_VULKAN_DRAFT_VERSION 1
+// Set each parameter's version to this value. Unknown versions are rejected.
+#define MPV_VULKAN_API_VERSION 1
+// Compatibility name for clients built against the 2.7/draft 1 header.
+#define MPV_VULKAN_DRAFT_VERSION MPV_VULKAN_API_VERSION
 
 /**
  * MPV_RENDER_PARAM_VULKAN_INIT_PARAMS, for context creation only.
  * Select API "vulkan" and renderer "gpu-next". No window or swapchain is
- * created by libmpv. Hardware-decoder interoperability is not validated.
+ * created by libmpv. Hardware-decoder interoperability is platform-dependent.
+ *
+ * An invalid parameter or unknown version returns MPV_ERROR_INVALID_PARAMETER.
+ * A missing backend returns MPV_ERROR_NOT_IMPLEMENTED. Device requirements or
+ * device import failures return MPV_ERROR_UNSUPPORTED.
  *
  * The caller owns all Vulkan handles. The instance and device must outlive
  * the render context. All Render API calls must be externally serialized,
@@ -42,7 +53,7 @@
  * Vulkan 1.2 is required. features is the chain actually ENABLED when creating
  * device, not a supported-features query. It must enable hostQueryReset and
  * timelineSemaphore (Vulkan12Features or the corresponding extension structs).
- * This draft also requires synchronization2, including VK_KHR_synchronization2
+ * v1 also requires synchronization2, including VK_KHR_synchronization2
  * on Vulkan 1.2, because the pinned libplacebo's legacy barrier lowering cannot
  * handle the NONE stages used for returning external images.
  * extensions likewise lists the device extensions actually enabled.
@@ -50,7 +61,7 @@
  * Only queue 0 of queue_family is imported. It must have been created and must
  * support both graphics and compute. Images must be owned by this family (or
  * concurrently shared with it); transfers to other families are not supported
- * by this draft.
+ * by v1.
  *
  * Both callbacks are required and must lock the same mutex as the caller's
  * queue submissions/presentation. They may be invoked from different threads.
@@ -112,7 +123,7 @@ typedef enum mpv_vulkan_target_state {
  * kind must match creation. Signal values must obey Vulkan monotonicity rules.
  * Never reuse a binary signal before its previous signal has been consumed.
  * All supplied semaphores must remain alive until context destruction AND
- * completion of the caller's GPU operations. This conservative draft lifetime
+ * completion of the caller's GPU operations. This conservative v1 lifetime
  * accommodates libplacebo's deferred semaphore references.
  *
  * render() returning is NOT GPU completion. Consult state even on failure;

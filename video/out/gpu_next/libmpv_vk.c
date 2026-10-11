@@ -68,7 +68,7 @@ int libmpv_vk_create(struct render_backend *ctx, mpv_render_param *params,
 {
     mpv_vulkan_init_params *init = get_mpv_render_param(
         params, MPV_RENDER_PARAM_VULKAN_INIT_PARAMS, NULL);
-    if (!init || init->version != MPV_VULKAN_DRAFT_VERSION ||
+    if (!init || init->version != MPV_VULKAN_API_VERSION ||
         !init->instance || !init->physical_device || !init->device ||
         !init->get_proc_address || !init->features ||
         init->features->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 ||
@@ -165,7 +165,7 @@ int libmpv_vk_get_target_size(struct libmpv_vk *p, mpv_render_param *params,
 {
     mpv_vulkan_target *t = get_mpv_render_param(
         params, MPV_RENDER_PARAM_VULKAN_TARGET, NULL);
-    if (!t || t->version != MPV_VULKAN_DRAFT_VERSION)
+    if (!t || t->version != MPV_VULKAN_API_VERSION)
         return MPV_ERROR_INVALID_PARAMETER;
     t->state = MPV_VULKAN_TARGET_UNTOUCHED;
     if (p->failed || pl_gpu_is_failed(p->context.gpu))
@@ -278,7 +278,7 @@ int libmpv_vk_end_frame(struct libmpv_vk *p, mpv_render_param *params)
 int libmpv_vk_retire(struct libmpv_vk *p, void *data)
 {
     mpv_vulkan_retire_target *r = data;
-    if (!r || r->version != MPV_VULKAN_DRAFT_VERSION || !r->image)
+    if (!r || r->version != MPV_VULKAN_API_VERSION || !r->image)
         return MPV_ERROR_INVALID_PARAMETER;
     if (p->failed || pl_gpu_is_failed(p->context.gpu))
         return MPV_ERROR_GENERIC;

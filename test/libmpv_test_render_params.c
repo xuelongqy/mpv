@@ -46,7 +46,7 @@ static void check_create(const char *api, const char *renderer, bool include_ren
 int main(int argc, char **argv)
 {
     if (mpv_client_api_version() != MPV_CLIENT_API_VERSION ||
-        mpv_client_api_version() < MPV_MAKE_VERSION(2, 7))
+        mpv_client_api_version() < MPV_MAKE_VERSION(2, 8))
         return 1;
 
     check_create(MPV_RENDER_API_TYPE_SW, NULL, false, 0);

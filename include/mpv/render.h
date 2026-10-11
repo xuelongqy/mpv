@@ -445,9 +445,20 @@ typedef enum mpv_render_param_type {
      */
     MPV_RENDER_PARAM_RENDERER = 21,
 
-    /** Downstream experimental Vulkan parameters. See the render_vk.h draft. */
+    /**
+     * Vulkan context initialization, for create() only.
+     * Type: mpv_vulkan_init_params*. See render_vk.h for the v1 contract.
+     */
     MPV_RENDER_PARAM_VULKAN_INIT_PARAMS = 22,
+    /**
+     * Vulkan rendering target, for render() only. This parameter is in/out.
+     * Type: mpv_vulkan_target*. See render_vk.h, including failure states.
+     */
     MPV_RENDER_PARAM_VULKAN_TARGET = 23,
+    /**
+     * Retire a Vulkan target, for set_parameter() only.
+     * Type: mpv_vulkan_retire_target*. See render_vk.h for lifetime rules.
+     */
     MPV_RENDER_PARAM_VULKAN_RETIRE_TARGET = 24,
 } mpv_render_param_type;
 
