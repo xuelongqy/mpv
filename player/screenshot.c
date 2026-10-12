@@ -353,6 +353,11 @@ static struct mp_image *screenshot_get(struct MPContext *mpctx, int mode,
     if (!mpctx->video_out || !mpctx->video_out->config_ok)
         return NULL;
 
+    if (mpctx->video_out->caps & VO_CAP_NATIVE_VIDEOTOOLBOX) {
+        MP_ERR(mpctx->screenshot_ctx, "Screenshots are unavailable with native Apple output.\n");
+        return NULL;
+    }
+
     vo_wait_frame(mpctx->video_out); // important for each-frame mode
 
     bool use_sw = mpctx->opts->screenshot_sw;

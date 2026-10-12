@@ -866,6 +866,15 @@ if features['avfoundation']
     sources += files('audio/out/ao_avfoundation.m')
 endif
 
+apple_native = dependency('appleframeworks', modules: ['Foundation', 'AVFoundation',
+                          'CoreMedia', 'CoreVideo', 'CoreGraphics', 'QuartzCore'],
+                          required: get_option('apple-native').require(darwin))
+features += {'apple-native': apple_native.found()}
+if features['apple-native']
+    dependencies += apple_native
+    sources += files('video/out/libmpv_apple.m')
+endif
+
 coreaudio = dependency('appleframeworks', modules: ['CoreFoundation', 'CoreAudio',
                        'AudioUnit', 'AudioToolbox'], required: get_option('coreaudio'))
 features += {'coreaudio': coreaudio.found()}

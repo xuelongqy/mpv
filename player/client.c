@@ -42,6 +42,7 @@
 #include "osdep/timer.h"
 #include "osdep/io.h"
 #include "stream/stream.h"
+#include "demux/demux.h"
 
 #include "command.h"
 #include "core.h"
@@ -2159,6 +2160,47 @@ void kill_video_async(struct mp_client_api *client_api)
 {
     struct MPContext *mpctx = client_api->mpctx;
     mp_dispatch_enqueue(mpctx->dispatch, do_kill, mpctx);
+}
+
+struct output_fallback {
+    struct mp_client_api *api;
+    mpv_render_context *ctx;
+    uint64_t serial;
+};
+
+static void do_fallback(void *ptr)
+{
+    struct output_fallback *args = ptr;
+    struct mp_client_api *api = args->api;
+    mp_mutex_lock(&api->lock);
+    bool current = api->render_context == args->ctx;
+    mp_mutex_unlock(&api->lock);
+    struct MPContext *mpctx = api->mpctx;
+    // The current VO retains its context while this core-thread callback runs.
+    if (current && mpctx->vo_chain && mpctx->video_out &&
+        (mpctx->video_out->caps & VO_CAP_AUTO_OUTPUT) &&
+        mp_render_context_can_fallback(args->ctx, args->serial)) {
+        struct track *track = mpctx->vo_chain->track;
+        double pts = mpctx->video_pts;
+        // Discard all native frames before opening a normal decoder at the same PTS.
+        uninit_video_out(mpctx);
+        if (track && track->stream && pts != MP_NOPTS_VALUE && mpctx->demuxer->seekable) {
+            reinit_video_chain_src(mpctx, track);
+            queue_seek(mpctx, MPSEEK_ABSOLUTE, pts, MPSEEK_EXACT, 0);
+        } else if (track) {
+            mpctx->error_playing = MPV_ERROR_VO_INIT_FAILED;
+            error_on_track(mpctx, track);
+        }
+    }
+    talloc_free(ptr);
+}
+
+void fallback_video_async(struct mp_client_api *client_api, mpv_render_context *ctx,
+                           uint64_t serial)
+{
+    struct output_fallback *args = talloc_ptrtype(NULL, args);
+    *args = (struct output_fallback){client_api, ctx, serial};
+    mp_dispatch_enqueue(client_api->mpctx->dispatch, do_fallback, args);
 }
 
 // Used by vo_libmpv to set the current render context.

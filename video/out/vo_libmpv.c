@@ -18,6 +18,9 @@
 #include "dr_helper.h"
 #include "vo.h"
 #include "video/mp_image.h"
+#include "video/out/gpu/video.h"
+#include "video/out/gpu/lcms.h"
+#include "demux/stheader.h"
 #include "sub/osd.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
@@ -61,6 +64,7 @@ struct mpv_render_context {
     struct mp_log *log;
     struct mpv_global *global;
     struct mp_client_api *client_api;
+    uint64_t serial;
 
     atomic_bool in_use;
 
@@ -100,6 +104,7 @@ struct mpv_render_context {
     bool need_reset;
     bool need_update_external;
     struct vo *vo;
+    bool native_rejected, recovering, dovi, hdr;
 
     // --- Mostly immutable after init.
     struct mp_hwdec_devices *hwdec_devs;
@@ -107,6 +112,10 @@ struct mpv_render_context {
     // --- All of these can only be accessed from mpv_render_*() API, for
     //     which the user makes sure they're called synchronized.
     struct render_backend *renderer;
+    struct render_backend *render_renderer, *native_renderer;
+    bool auto_output;
+    struct m_config_cache *auto_opts, *auto_gpu_opts;
+    struct mp_csp_equalizer_state *auto_eq;
     struct m_config_cache *vo_opts_cache;
     struct mp_vo_opts *vo_opts;
 };
@@ -115,6 +124,9 @@ const struct render_backend_fns *render_backends[] = {
     &render_backend_gpu,
     &render_backend_gpu_next,
     &render_backend_sw,
+#if HAVE_APPLE_NATIVE
+    &render_backend_apple,
+#endif
     NULL
 };
 
@@ -162,10 +174,61 @@ static struct mp_image *render_get_image(void *ptr, int imgfmt, int w, int h,
     return ctx->renderer->fns->get_image(ctx->renderer, imgfmt, w, h, stride_align, flags);
 }
 
+static struct render_backend *create_backend(mpv_render_context *ctx,
+    const struct render_backend_fns *fns, mpv_render_param *params, int *error)
+{
+    struct render_backend *backend = talloc_zero(NULL, struct render_backend);
+    *backend = (struct render_backend){.global = ctx->global, .log = ctx->log, .fns = fns};
+    *error = fns->init(backend, params);
+    if (*error < 0) {
+        fns->destroy(backend);
+        talloc_free(backend->priv);
+        TA_FREEP(&backend);
+    }
+    return backend;
+}
+
+static bool native_processing_supported(mpv_render_context *ctx)
+{
+    m_config_cache_update(ctx->auto_opts);
+    struct MPOpts *opts = ctx->auto_opts->opts;
+    if (opts->vf_settings && opts->vf_settings[0].name)
+        return false;
+    struct mp_csp_params eq = {0};
+    mp_csp_equalizer_state_get(ctx->auto_eq, &eq);
+    if (eq.brightness != 0 || eq.contrast != 1 || eq.hue != 0 ||
+        eq.saturation != 1 || eq.gamma != 1 || eq.levels_out != PL_COLOR_LEVELS_UNKNOWN)
+        return false;
+    if (!ctx->auto_gpu_opts)
+        return true;
+    m_config_cache_update(ctx->auto_gpu_opts);
+    struct gl_video_opts *gpu = ctx->auto_gpu_opts->opts;
+    return gpu->gamma == 1 && !gpu->gamma_auto &&
+           !(gpu->user_shaders && gpu->user_shaders[0]) && !gpu->interpolation &&
+           !gpu->deband && !gpu->unsharp && !(gpu->icc_opts && gpu->icc_opts->profile);
+}
+
+static bool safe_render_fallback(mpv_render_context *ctx)
+{
+    return ctx->render_renderer && (!ctx->dovi ||
+           ctx->render_renderer->fns == &render_backend_gpu_next) &&
+           (!ctx->hdr || ctx->render_renderer->fns != &render_backend_sw);
+}
+
+bool mp_render_context_can_fallback(mpv_render_context *ctx, uint64_t serial)
+{
+    mp_mutex_lock(&ctx->lock);
+    bool ok = ctx->serial == serial && ctx->auto_output && ctx->recovering && safe_render_fallback(ctx);
+    mp_mutex_unlock(&ctx->lock);
+    return ok;
+}
+
 int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
                               mpv_render_param *params)
 {
     mpv_render_context *ctx = talloc_zero(NULL, mpv_render_context);
+    static atomic_uint_fast64_t next_serial = 1;
+    ctx->serial = atomic_fetch_add(&next_serial, 1);
     mp_mutex_init(&ctx->control_lock);
     mp_mutex_init(&ctx->lock);
     mp_mutex_init(&ctx->update_lock);
@@ -186,6 +249,30 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
         ctx->advanced_control = true;
 
     const struct render_backend_fns *selected = NULL;
+    const char *mode = get_mpv_render_param(params, MPV_RENDER_PARAM_OUTPUT_MODE, NULL);
+    for (int n = 0; params && params[n].type; n++) {
+        if (params[n].type == MPV_RENDER_PARAM_OUTPUT_MODE && !mode) {
+            mpv_render_context_free(ctx);
+            return MPV_ERROR_INVALID_PARAMETER;
+        }
+    }
+    if (mode && strcmp(mode, "render") && strcmp(mode, "native") && strcmp(mode, "auto")) {
+        mpv_render_context_free(ctx);
+        return MPV_ERROR_INVALID_PARAMETER;
+    }
+    ctx->auto_output = mode && !strcmp(mode, "auto");
+    if (ctx->auto_output && !ctx->advanced_control) {
+        mpv_render_context_free(ctx);
+        return MPV_ERROR_INVALID_PARAMETER;
+    }
+    if (mode && !strcmp(mode, "native")) {
+#if HAVE_APPLE_NATIVE
+        selected = &render_backend_apple;
+#else
+        mpv_render_context_free(ctx);
+        return MPV_ERROR_NOT_IMPLEMENTED;
+#endif
+    }
     bool selector_present = false;
     char *selector = NULL;
     for (int n = 0; params && params[n].type; n++) {
@@ -196,6 +283,10 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
         }
     }
     if (selector_present) {
+        if (mode && !strcmp(mode, "native")) {
+            mpv_render_context_free(ctx);
+            return MPV_ERROR_INVALID_PARAMETER;
+        }
         if (!selector || !selector[0]) {
             mpv_render_context_free(ctx);
             return MPV_ERROR_INVALID_PARAMETER;
@@ -210,24 +301,50 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
     }
 
     int err = MPV_ERROR_NOT_IMPLEMENTED;
-    for (int n = 0; render_backends[n]; n++) {
+    if (ctx->auto_output && !selector_present) {
+        const struct render_backend_fns *preferred[] = {
+            &render_backend_gpu_next, &render_backend_gpu, &render_backend_sw,
+        };
+        for (int n = 0; n < MP_ARRAY_SIZE(preferred); n++) {
+            ctx->renderer = create_backend(ctx, preferred[n], params, &err);
+            if (ctx->renderer || (err != MPV_ERROR_NOT_IMPLEMENTED && err != MPV_ERROR_UNSUPPORTED))
+                break;
+        }
+    }
+    for (int n = 0; render_backends[n] && (!ctx->auto_output || selector_present); n++) {
+#if HAVE_APPLE_NATIVE
+        if (mode && !strcmp(mode, "render") && render_backends[n] == &render_backend_apple)
+            continue;
+#endif
         if (selected && render_backends[n] != selected)
             continue;
-        ctx->renderer = talloc_zero(NULL, struct render_backend);
-        *ctx->renderer = (struct render_backend){
-            .global = ctx->global,
-            .log = ctx->log,
-            .fns = render_backends[n],
-        };
-        err = ctx->renderer->fns->init(ctx->renderer, params);
+        ctx->renderer = create_backend(ctx, render_backends[n], params, &err);
         if (err >= 0)
             break;
-        ctx->renderer->fns->destroy(ctx->renderer);
-        talloc_free(ctx->renderer->priv);
-        TA_FREEP(&ctx->renderer);
         if (err != MPV_ERROR_NOT_IMPLEMENTED)
             break;
     }
+
+    if (ctx->renderer && (ctx->renderer->driver_caps & VO_CAP_NATIVE_VIDEOTOOLBOX))
+        ctx->native_renderer = ctx->renderer;
+    else
+        ctx->render_renderer = ctx->renderer;
+#if HAVE_APPLE_NATIVE
+    if (ctx->auto_output && get_mpv_render_param(params, MPV_RENDER_PARAM_APPLE_NATIVE_INIT_PARAMS, NULL) &&
+        (err >= 0 || err == MPV_ERROR_NOT_IMPLEMENTED || err == MPV_ERROR_UNSUPPORTED)) {
+        mpv_render_param native[] = {{MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_APPLE_NATIVE},
+            {MPV_RENDER_PARAM_APPLE_NATIVE_INIT_PARAMS,
+             get_mpv_render_param(params, MPV_RENDER_PARAM_APPLE_NATIVE_INIT_PARAMS, NULL)}, {0}};
+        int native_err;
+        ctx->native_renderer = create_backend(ctx, &render_backend_apple, native, &native_err);
+        if (native_err == MPV_ERROR_INVALID_PARAMETER)
+            err = native_err;
+        else if (!ctx->renderer && ctx->native_renderer) {
+            ctx->renderer = ctx->native_renderer;
+            err = 0;
+        }
+    }
+#endif
 
     if (err < 0) {
         mpv_render_context_free(ctx);
@@ -239,9 +356,20 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
     for (int n = IMGFMT_START; n < IMGFMT_END; n++) {
         ctx->imgfmt_supported[n - IMGFMT_START] =
             ctx->renderer->fns->check_format(ctx->renderer, n);
+        if (ctx->auto_output && ctx->native_renderer)
+            ctx->imgfmt_supported[n - IMGFMT_START] |=
+                ctx->native_renderer->fns->check_format(ctx->native_renderer, n);
     }
 
-    if (ctx->renderer->fns->get_image && ctx->advanced_control)
+    if (ctx->auto_output && ctx->native_renderer) {
+        ctx->auto_opts = m_config_cache_alloc(ctx, ctx->global, &mp_opt_root);
+        ctx->auto_eq = mp_csp_equalizer_create(ctx, ctx->global);
+#if HAVE_GL || HAVE_VULKAN
+        ctx->auto_gpu_opts = m_config_cache_alloc(ctx, ctx->global, &gl_video_conf);
+#endif
+    }
+    // shortcut: auto uses CPU allocations until DR can retain a backend-specific allocator.
+    if (ctx->renderer->fns->get_image && ctx->advanced_control && !ctx->auto_output)
         ctx->dr = dr_helper_create(ctx->dispatch, render_get_image, ctx);
 
     if (!mp_set_main_render_context(ctx->client_api, ctx, true)) {
@@ -334,10 +462,13 @@ void mpv_render_context_free(mpv_render_context *ctx)
 
     forget_frames(ctx, true);
 
-    if (ctx->renderer) {
-        ctx->renderer->fns->destroy(ctx->renderer);
-        talloc_free(ctx->renderer->priv);
-        talloc_free(ctx->renderer);
+    struct render_backend *backends[] = {ctx->render_renderer, ctx->native_renderer};
+    for (int n = 0; n < MP_ARRAY_SIZE(backends); n++) {
+        if (backends[n]) {
+            backends[n]->fns->destroy(backends[n]);
+            talloc_free(backends[n]->priv);
+            talloc_free(backends[n]);
+        }
     }
     talloc_free(ctx->dr);
     talloc_free(ctx->dispatch);
@@ -364,8 +495,19 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
 {
     mp_mutex_lock(&ctx->lock);
 
+    if (ctx->recovering) {
+        mp_mutex_unlock(&ctx->lock);
+        return MPV_ERROR_UNSUPPORTED;
+    }
+
     int do_render =
         !GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_SKIP_RENDERING, int, 0);
+
+    if (do_render && ctx->renderer->fns->present && !GET_MPV_RENDER_PARAM(
+            params, MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, int, 1)) {
+        mp_mutex_unlock(&ctx->lock);
+        return MPV_ERROR_INVALID_PARAMETER;
+    }
 
     if (do_render) {
         int vp_w, vp_h;
@@ -435,8 +577,25 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
 
     int err = 0;
 
-    if (do_render)
-        err = ctx->renderer->fns->render(ctx->renderer, params, frame);
+    double pts = frame->current ? frame->current->pts : MP_NOPTS_VALUE;
+    if (do_render) {
+        bool native = ctx->renderer->driver_caps & VO_CAP_NATIVE_VIDEOTOOLBOX;
+        bool unsafe_dovi = ctx->auto_output && frame->current && !native &&
+            frame->current->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+            ctx->renderer->fns != &render_backend_gpu_next;
+        bool unsafe_hdr = ctx->auto_output && frame->current &&
+            ctx->renderer->fns == &render_backend_sw &&
+            (frame->current->params.color.transfer == PL_COLOR_TRC_PQ ||
+             frame->current->params.color.transfer == PL_COLOR_TRC_HLG);
+        if (unsafe_dovi || unsafe_hdr) {
+            MP_ERR(ctx, "Auto output cannot render this HDR/DV frame with the fallback.\n");
+            err = MPV_ERROR_UNSUPPORTED;
+        } else if (ctx->auto_output && native && !native_processing_supported(ctx)) {
+            err = MPV_ERROR_UNSUPPORTED;
+        } else {
+            err = ctx->renderer->fns->render(ctx->renderer, params, frame);
+        }
+    }
 
     if (frame != &dummy)
         talloc_free(frame);
@@ -447,6 +606,20 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
         mp_mutex_lock(&ctx->lock);
         while (wait_present_count > ctx->present_count)
             mp_cond_wait(&ctx->video_wait, &ctx->lock);
+        mp_mutex_unlock(&ctx->lock);
+    }
+
+    if (do_render && !err && ctx->renderer->fns->present)
+        err = ctx->renderer->fns->present(ctx->renderer);
+
+    if (err < 0 && pts != MP_NOPTS_VALUE && ctx->auto_output &&
+        (ctx->renderer->driver_caps & VO_CAP_NATIVE_VIDEOTOOLBOX)) {
+        mp_mutex_lock(&ctx->lock);
+        if (!ctx->native_rejected && safe_render_fallback(ctx)) {
+            ctx->native_rejected = ctx->recovering = true;
+            fallback_video_async(ctx->client_api, ctx, ctx->serial);
+            MP_WARN(ctx, "Native output failed; reopening normal decoding for render output.\n");
+        }
         mp_mutex_unlock(&ctx->lock);
     }
 
@@ -479,6 +652,10 @@ uint64_t mpv_render_context_update(mpv_render_context *ctx)
 int mpv_render_context_set_parameter(mpv_render_context *ctx,
                                      mpv_render_param param)
 {
+    if (ctx->auto_output && ctx->render_renderer &&
+        (param.type == MPV_RENDER_PARAM_VULKAN_RETIRE_TARGET ||
+         param.type == MPV_RENDER_PARAM_ICC_PROFILE))
+        return ctx->render_renderer->fns->set_parameter(ctx->render_renderer, param);
     return ctx->renderer->fns->set_parameter(ctx->renderer, param);
 }
 
@@ -489,6 +666,16 @@ int mpv_render_context_get_info(mpv_render_context *ctx,
     mp_mutex_lock(&ctx->lock);
 
     switch (param.type) {
+    case MPV_RENDER_PARAM_OUTPUT_MODE:
+        if (param.data) {
+            *(const char **)param.data =
+                ctx->recovering ? "recovering" :
+                ctx->renderer->driver_caps & VO_CAP_NATIVE_VIDEOTOOLBOX ? "native" : "render";
+            res = 0;
+        } else {
+            res = MPV_ERROR_INVALID_PARAMETER;
+        }
+        break;
     case MPV_RENDER_PARAM_NEXT_FRAME_INFO: {
         mpv_render_frame_info *info = param.data;
         *info = (mpv_render_frame_info){0};
@@ -603,6 +790,53 @@ static void run_control_on_render_thread(void *p)
     int ret = VO_NOTIMPL;
 
     switch (request) {
+    case VOCTRL_SELECT_OUTPUT:
+    case VOCTRL_FALLBACK_OUTPUT: {
+        struct mp_codec_params *codec = data;
+        mp_mutex_lock(&ctx->lock);
+        if (request == VOCTRL_FALLBACK_OUTPUT)
+            ctx->native_rejected = true;
+        else {
+            ctx->dovi = codec && codec->dovi;
+            ctx->hdr = codec && (codec->color.transfer == PL_COLOR_TRC_PQ ||
+                                  codec->color.transfer == PL_COLOR_TRC_HLG);
+        }
+        mp_mutex_unlock(&ctx->lock);
+        bool native = false;
+#if HAVE_APPLE_NATIVE
+        native = !ctx->native_rejected && ctx->native_renderer &&
+            native_processing_supported(ctx) && mpv_apple_native_supported(ctx->native_renderer, codec) &&
+            (ctx->dovi || !safe_render_fallback(ctx));
+#endif
+        struct render_backend *next = native ? ctx->native_renderer : ctx->render_renderer;
+        if (!next || (!native && !safe_render_fallback(ctx))) {
+            MP_ERR(ctx, "No supported output for this resource; refusing an unsafe DV fallback.\n");
+            ret = VO_NOTAVAIL;
+            break;
+        }
+        if (next != ctx->renderer) {
+            ctx->renderer->fns->reset(ctx->renderer);
+            ctx->renderer->fns->update_external(ctx->renderer, NULL);
+            mp_mutex_lock(&ctx->lock);
+            forget_frames(ctx, true);
+            TA_FREEP(&ctx->next_frame);
+            ctx->present_count += 2;
+            ctx->renderer = next;
+            ctx->hwdec_devs = next->hwdec_devs;
+            ctx->need_reconfig = ctx->need_resize = ctx->need_reset = ctx->need_update_external = true;
+            mp_mutex_unlock(&ctx->lock);
+        }
+        mp_mutex_lock(&ctx->lock);
+        ctx->recovering = false;
+        ctx->vo->hwdec_devs = ctx->hwdec_devs;
+        ctx->vo->caps = ctx->renderer->driver_caps | VO_CAP_AUTO_OUTPUT;
+        if (!(ctx->vo->caps & VO_CAP_NATIVE_VIDEOTOOLBOX))
+            ctx->vo->caps |= VO_CAP_ROTATE90 | VO_CAP_VFLIP;
+        mp_mutex_unlock(&ctx->lock);
+        MP_VERBOSE(ctx, "Auto output: %s.\n", native ? "native" : "render");
+        ret = VO_TRUE;
+        break;
+    }
     case VOCTRL_SCREENSHOT: {
         mp_mutex_lock(&ctx->lock);
         struct vo_frame *frame = vo_frame_ref(ctx->cur_frame);
@@ -657,6 +891,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
     // VOCTRLs to be run on the renderer thread (if possible at all).
     if (ctx->advanced_control) {
         switch (request) {
+        case VOCTRL_SELECT_OUTPUT:
+        case VOCTRL_FALLBACK_OUTPUT:
         case VOCTRL_SCREENSHOT:
         case VOCTRL_PERFORMANCE_DATA: {
             int ret;
@@ -725,6 +961,7 @@ static void uninit(struct vo *vo)
     ctx->need_update_external = true;
     ctx->need_reset = true;
     ctx->vo = NULL;
+    ctx->recovering = false;
 
     // The following do not normally need ctx->lock, however, ctx itself may
     // become invalid once we release ctx->lock.
@@ -756,7 +993,12 @@ static int preinit(struct vo *vo)
         return -1;
     }
 
-    vo->caps |= ctx->renderer->driver_caps;
+    if (ctx->renderer->driver_caps & VO_CAP_NATIVE_VIDEOTOOLBOX)
+        vo->caps = ctx->renderer->driver_caps;
+    else
+        vo->caps |= ctx->renderer->driver_caps;
+    if (ctx->auto_output)
+        vo->caps |= VO_CAP_AUTO_OUTPUT;
 
     mp_mutex_lock(&ctx->lock);
     ctx->vo = vo;

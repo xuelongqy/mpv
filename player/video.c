@@ -250,6 +250,14 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
         mpctx->mouse_cursor_visible = true;
     }
 
+    if (mpctx->video_out->caps & VO_CAP_AUTO_OUTPUT) {
+        if (vo_control(mpctx->video_out, VOCTRL_SELECT_OUTPUT,
+                       track ? track->stream->codec : NULL) != VO_TRUE) {
+            mpctx->error_playing = MPV_ERROR_VO_INIT_FAILED;
+            goto err_out;
+        }
+    }
+
     update_window_title(mpctx, true);
 
     struct vo_chain *vo_c = talloc_zero(NULL, struct vo_chain);

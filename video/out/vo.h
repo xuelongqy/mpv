@@ -79,6 +79,8 @@ enum mp_voctrl {
     VOCTRL_PREINIT,
     VOCTRL_UNINIT,
     VOCTRL_RECONFIG,
+    VOCTRL_SELECT_OUTPUT,               // struct mp_codec_params*, libmpv auto only
+    VOCTRL_FALLBACK_OUTPUT,             // libmpv auto only
 
     VOCTRL_UPDATE_WINDOW_TITLE,         // char*
     VOCTRL_UPDATE_PLAYBACK_STATE,       // struct voctrl_playback_state*
@@ -205,6 +207,9 @@ enum {
     VO_CAP_FRAMEOWNER   = 1 << 5,
     // VO does handle mp_image_params.vflip
     VO_CAP_VFLIP        = 1 << 6,
+    // Native Apple output needs direct VideoToolbox frames and their metadata.
+    VO_CAP_NATIVE_VIDEOTOOLBOX = 1 << 7,
+    VO_CAP_AUTO_OUTPUT = 1 << 8,
 };
 
 enum {

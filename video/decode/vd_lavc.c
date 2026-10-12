@@ -512,6 +512,10 @@ static void select_and_set_hwdec(struct mp_filter *vd)
     add_all_hwdec_methods(&hwdecs, &num_hwdecs);
 
     char **hwdec_api = ctx->hwdec_opts->hwdec_api;
+    char *native_api[] = {"videotoolbox", NULL};
+    bool native = ctx->vo && (ctx->vo->caps & VO_CAP_NATIVE_VIDEOTOOLBOX);
+    if (native)
+        hwdec_api = native_api;
     for (int i = 0; hwdec_api && hwdec_api[i]; i++) {
         bstr opt = bstr0(hwdec_api[i]);
 
@@ -531,7 +535,7 @@ static void select_and_set_hwdec(struct mp_filter *vd)
         if (!hwdec_requested) {
             MP_VERBOSE(vd, "No hardware decoding requested.\n");
             break;
-        } else if (!hwdec_codec_allowed(vd, codec)) {
+        } else if (!native && !hwdec_codec_allowed(vd, codec)) {
             MP_VERBOSE(vd, "Not trying to use hardware decoding: codec %s is not "
                     "on whitelist.\n", codec);
             break;
@@ -643,7 +647,7 @@ static void select_and_set_hwdec(struct mp_filter *vd)
     } else {
         // If software fallback is disabled and we get here, all hwdec must
         // have failed. Tell the ctx to always force an eof.
-        if (ctx->hwdec_opts->software_fallback == INT_MAX) {
+        if (native || ctx->hwdec_opts->software_fallback == INT_MAX) {
             MP_WARN(ctx, "Software decoding fallback is disabled.\n");
             ctx->force_eof = true;
         } else {
@@ -685,6 +689,11 @@ static void force_fallback(struct mp_filter *vd)
     vd_ffmpeg_ctx *ctx = vd->priv;
 
     uninit_avctx(vd);
+    if (ctx->vo && (ctx->vo->caps & VO_CAP_AUTO_OUTPUT) &&
+        (ctx->vo->caps & VO_CAP_NATIVE_VIDEOTOOLBOX)) {
+        if (vo_control(ctx->vo, VOCTRL_FALLBACK_OUTPUT, NULL) == VO_TRUE)
+            ctx->hwdec_devs = ctx->vo->hwdec_devs;
+    }
     int lev = ctx->hwdec_notified ? MSGL_WARN : MSGL_V;
     mp_msg(vd->log, lev, "Attempting next decoding method after failure of %.*s.\n",
            BSTR_P(ctx->attempted_hwdecs[ctx->num_attempted_hwdecs - 1]));
@@ -865,6 +874,20 @@ static void init_avctx(struct mp_filter *vd)
     if (mp_set_avctx_codec_headers(avctx, c) < 0) {
         MP_ERR(vd, "Could not set codec parameters.\n");
         goto error;
+    }
+
+    if (ctx->vo && (ctx->vo->caps & VO_CAP_NATIVE_VIDEOTOOLBOX) &&
+        lavc_codec->id == AV_CODEC_ID_HEVC) {
+        const AVPacketSideData *dovi = av_packet_side_data_get(
+            avctx->coded_side_data, avctx->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF);
+        if (dovi && av_opt_set_int(avctx, "vt_native_dv", 1, AV_OPT_SEARCH_CHILDREN) < 0) {
+            MP_ERR(vd, "Native DV needs a compatible VideoToolbox decoder.\n");
+            goto error;
+        }
+    } else if (ctx->vo && (ctx->vo->caps & VO_CAP_AUTO_OUTPUT) &&
+               lavc_codec->id == AV_CODEC_ID_HEVC) {
+        // A render fallback must not receive pixels already processed as native DV.
+        av_opt_set_int(avctx, "vt_native_dv", 0, AV_OPT_SEARCH_CHILDREN);
     }
 
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION

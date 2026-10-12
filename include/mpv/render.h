@@ -460,6 +460,27 @@ typedef enum mpv_render_param_type {
      * Type: mpv_vulkan_retire_target*. See render_vk.h for lifetime rules.
      */
     MPV_RENDER_PARAM_VULKAN_RETIRE_TARGET = 24,
+    /**
+     * Experimental output policy, for create() only. Type: char*.
+     * "render" preserves the existing renderer selection. "native" selects
+     * the platform output API and cannot be combined with RENDERER.
+     * "auto" prefers native DV on supported Apple outputs, otherwise render.
+     * It requires ADVANCED_CONTROL=1. API_TYPE and RENDERER configure the
+     * render fallback; an optional APPLE_NATIVE_INIT_PARAMS supplies the
+     * native output. Without RENDERER, gpu-next is tried before gpu/software.
+     * Software/old gpu are not safe fallbacks for DV. No API or device is
+     * created on the caller's behalf.
+     * Omission preserves the existing API/default renderer behavior.
+     * For get_info(), data is const char** and receives the actual output
+     * mode ("render", "native" or transient "recovering"), as a static string.
+     * Experimental clients must query this before playback; older libraries
+     * ignore unknown create parameters but return NOT_IMPLEMENTED for this query.
+     */
+    MPV_RENDER_PARAM_OUTPUT_MODE = 25,
+    /** Experimental Apple native context. See render_apple.h. */
+    MPV_RENDER_PARAM_APPLE_NATIVE_INIT_PARAMS = 26,
+    /** Experimental Apple native target. See render_apple.h. */
+    MPV_RENDER_PARAM_APPLE_NATIVE_TARGET = 27,
 } mpv_render_param_type;
 
 /**
@@ -507,6 +528,7 @@ typedef struct mpv_render_param {
 // See section "Software renderer"
 #define MPV_RENDER_API_TYPE_SW "sw"
 #define MPV_RENDER_API_TYPE_VULKAN "vulkan"
+#define MPV_RENDER_API_TYPE_APPLE_NATIVE "apple-native"
 
 /**
  * Flags used in mpv_render_frame_info.flags. Each value represents a bit in it.

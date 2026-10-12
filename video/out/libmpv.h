@@ -75,6 +75,8 @@ struct render_backend_fns {
     // Implementation of mpv_render_context_render().
     int (*render)(struct render_backend *ctx, mpv_render_param *params,
                   struct vo_frame *frame);
+    // Optional native presentation, after waiting for the frame's target time.
+    int (*present)(struct render_backend *ctx);
     // Free all data in ctx->priv.
     void (*destroy)(struct render_backend *ctx);
 };
@@ -82,3 +84,8 @@ struct render_backend_fns {
 extern const struct render_backend_fns render_backend_gpu;
 extern const struct render_backend_fns render_backend_gpu_next;
 extern const struct render_backend_fns render_backend_sw;
+extern const struct render_backend_fns render_backend_apple;
+struct mp_codec_params;
+bool mpv_apple_native_supported(struct render_backend *ctx,
+                                const struct mp_codec_params *codec);
+bool mp_render_context_can_fallback(mpv_render_context *ctx, uint64_t serial);
