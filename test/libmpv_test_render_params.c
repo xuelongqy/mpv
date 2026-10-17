@@ -43,6 +43,45 @@ static void check_create(const char *api, const char *renderer, bool include_ren
     mpv_terminate_destroy(mpv);
 }
 
+static void check_output_modes(void)
+{
+    mpv_handle *mpv = mpv_create();
+    if (!mpv || mpv_set_option_string(mpv, "vo", "libmpv") < 0 ||
+        mpv_initialize(mpv) < 0)
+        exit(1);
+
+    int advanced = 1;
+    const char *modes[] = {NULL, "render", "auto", "native", "invalid", ""};
+    for (size_t n = 0; n < sizeof(modes) / sizeof(modes[0]); n++) {
+        mpv_render_param params[] = {
+            {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_SW},
+            {MPV_RENDER_PARAM_ADVANCED_CONTROL, &advanced},
+            {modes[n] ? MPV_RENDER_PARAM_OUTPUT_MODE : 0, (void *)modes[n]},
+            {0},
+        };
+        mpv_render_context *ctx = NULL;
+        int expected = n < 3 ? 0 : n == 3 ? MPV_ERROR_NOT_IMPLEMENTED
+                                         : MPV_ERROR_INVALID_PARAMETER;
+        int err = mpv_render_context_create(&ctx, mpv, params);
+        if (err != expected || (err == 0 && !ctx) || (err < 0 && ctx)) {
+            fprintf(stderr, "output mode %s: expected %d, got %d\n",
+                    modes[n] ? modes[n] : "(default)", expected, err);
+            exit(1);
+        }
+        if (ctx) {
+            const char *actual = NULL;
+            err = mpv_render_context_get_info(ctx,
+                (mpv_render_param){MPV_RENDER_PARAM_OUTPUT_MODE, &actual});
+            if (err < 0 || !actual || strcmp(actual, "render")) {
+                fprintf(stderr, "unexpected actual output mode\n");
+                exit(1);
+            }
+            mpv_render_context_free(ctx);
+        }
+    }
+    mpv_terminate_destroy(mpv);
+}
+
 int main(int argc, char **argv)
 {
     if (mpv_client_api_version() != MPV_CLIENT_API_VERSION ||
@@ -62,5 +101,6 @@ int main(int argc, char **argv)
     check_create(MPV_RENDER_API_TYPE_VULKAN, "gpu-next", true, missing_init);
     check_create(MPV_RENDER_API_TYPE_VULKAN, "gpu", true, MPV_ERROR_NOT_IMPLEMENTED);
     check_create(MPV_RENDER_API_TYPE_VULKAN, "unknown", true, MPV_ERROR_INVALID_PARAMETER);
+    check_output_modes();
     return 0;
 }

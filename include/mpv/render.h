@@ -470,6 +470,11 @@ typedef enum mpv_render_param_type {
      * native output. Without RENDERER, gpu-next is tried before gpu/software.
      * Software/old gpu are not safe fallbacks for DV. No API or device is
      * created on the caller's behalf.
+     * Linux currently has no native Render API backend: "native" returns
+     * MPV_ERROR_NOT_IMPLEMENTED, while "auto" uses render output. For GPU
+     * output, the caller still supplies the GL/Vulkan context and configures
+     * HDR presentation; selecting "auto" does not enable system HDR or provide
+     * DV passthrough.
      * Omission preserves the existing API/default renderer behavior.
      * For get_info(), data is const char** and receives the actual output
      * mode ("render", "native" or transient "recovering"), as a static string.
