@@ -73,6 +73,11 @@
 #define CLOCK_MONOTONIC_RAW 4
 #endif
 
+#ifndef WP_PRESENTATION_FEEDBACK_KIND_VARIABLE_RATE_SINCE_VERSION
+#define WP_PRESENTATION_FEEDBACK_KIND_FIXED_RATE 0x10
+#define WP_PRESENTATION_FEEDBACK_KIND_VARIABLE_RATE 0x20
+#endif
+
 // From the fractional scale protocol
 #define WAYLAND_SCALE_FACTOR 120.0
 
@@ -166,6 +171,7 @@ struct vo_wayland_feedback_pool {
     struct wp_presentation_feedback **fback;
     struct vo_wayland_state *wl;
     int last_zero_copy;
+    int last_refresh_type;
     int len;
 };
 
@@ -1906,7 +1912,9 @@ static void apply_toplevel_config(struct vo_wayland_state *wl)
                                    opts->autofit_larger.wh_valid || opts->autofit_smaller.wh_valid;
         if (width && height && !autofit_or_geometry) {
             wl->initial_size_hint = true;
-            wl->window_size = (struct mp_rect){0, 0, width, height};
+            wl->window_size = (struct mp_rect){0, 0,
+                handle_round(wl->scaling, width), handle_round(wl->scaling, height)
+            };
             wl->geometry = wl->window_size;
         } else {
             wl->override_surface_local = true;
@@ -2592,6 +2600,20 @@ static void feedback_presented(void *data, struct wp_presentation_feedback *fbac
         fback_pool->last_zero_copy = current_zero_copy;
     }
 
+    if (wp_presentation_feedback_get_version(fback) >= 3) {
+        int refresh_type = flags & WP_PRESENTATION_FEEDBACK_KIND_FIXED_RATE ? 1 :
+                           flags & WP_PRESENTATION_FEEDBACK_KIND_VARIABLE_RATE ? 0 :
+                           -1;
+
+        if (fback_pool->last_refresh_type != refresh_type) {
+            MP_DBG(wl, "Presentation was done with %s refresh rate.\n",
+                   refresh_type == 1 ? "fixed" :
+                   refresh_type == 0 ? "variable" :
+                   "unknown");
+            fback_pool->last_refresh_type = refresh_type;
+        }
+    }
+
     if (fback)
         remove_feedback(fback_pool, fback);
 
@@ -2616,6 +2638,7 @@ static void feedback_discarded(void *data, struct wp_presentation_feedback *fbac
 {
     struct vo_wayland_feedback_pool *fback_pool = data;
     fback_pool->last_zero_copy = -1;
+    fback_pool->last_refresh_type = -1;
     if (fback)
         remove_feedback(fback_pool, fback);
 }
@@ -2930,8 +2953,7 @@ static void registry_handle_add(void *data, struct wl_registry *reg, uint32_t id
     }
 
     if (!strcmp(interface, wp_presentation_interface.name) && found++) {
-        ver = MPMIN(ver, 2);
-        wl->present_v2 = ver == 2;
+        ver = MPMIN(ver, 3);
         wl->presentation = wl_registry_bind(reg, id, &wp_presentation_interface, ver);
         wp_presentation_add_listener(wl->presentation, &presentation_listener, wl);
     }
@@ -3692,14 +3714,12 @@ static void set_color_management(struct vo_wayland_state *wl, struct pl_color_sp
         goto nosupport;
 
     struct wp_image_description_v1 *image_description;
-#if PL_API_VER >= 362
     // scRGB has dedicated creator, and not using the generic one.
     if (color->transfer == PL_COLOR_TRC_SCRGB && wl->supports_scrgb) {
         image_description = wp_color_manager_v1_create_windows_scrgb(wl->color_manager);
         cm_dispatch_color_queue(wl, image_description);
         return;
     }
-#endif
 
     int primaries = wl->primaries_map[color->primaries];
     int transfer = wl->transfer_map[color->transfer];
@@ -3948,12 +3968,22 @@ static int set_cursor_visibility_all_seats(struct vo_wayland_state *wl, bool on)
 static void set_geometry(struct vo_wayland_state *wl, bool resize)
 {
     struct vo *vo = wl->vo;
+    struct mp_vo_opts *opts = wl->opts;
     if (!wl->current_output)
         return;
 
+    bool autofit_or_geometry = opts->geometry.wh_valid || opts->autofit.wh_valid ||
+                               opts->autofit_larger.wh_valid || opts->autofit_smaller.wh_valid;
     struct vo_win_geometry geo;
     struct mp_rect screenrc = wl->current_output->geometry;
-    vo_calc_window_geometry(vo, wl->opts, &screenrc, &screenrc, wl->scaling_factor, false, &geo, NULL);
+    struct m_geometry bounds = {
+        .w = wl->bounded_width,
+        .h = wl->bounded_height,
+        .wh_valid = opts->wl_configure_bounds == 1 ||
+            (opts->wl_configure_bounds == -1 && !autofit_or_geometry),
+    };
+    vo_calc_window_geometry(vo, opts, &screenrc, &screenrc, wl->scaling_factor,
+                            false, &geo, &bounds);
     vo_apply_window_geometry(vo, &geo);
 
     int gcd = mp_gcd(vo->dwidth, vo->dheight);
@@ -4015,25 +4045,6 @@ static void set_surface_scaling(struct vo_wayland_state *wl)
     wl->scaling_factor = wl->scaling / WAYLAND_SCALE_FACTOR;
     rescale_geometry(wl, old_scale);
     wl->pending_vo_events |= VO_EVENT_DPI;
-}
-
-static void set_window_bounds(struct vo_wayland_state *wl)
-{
-    // If the user has set geometry/autofit and the option is auto,
-    // don't use these.
-    if (wl->opts->wl_configure_bounds == -1 && (wl->opts->geometry.wh_valid ||
-        wl->opts->autofit.wh_valid || wl->opts->autofit_larger.wh_valid ||
-        wl->opts->autofit_smaller.wh_valid))
-    {
-        return;
-    }
-
-    apply_keepaspect(wl, &wl->bounded_width, &wl->bounded_height);
-
-    if (wl->bounded_width && wl->bounded_width < wl->window_size.x1)
-        wl->window_size.x1 = wl->bounded_width;
-    if (wl->bounded_height && wl->bounded_height < wl->window_size.y1)
-        wl->window_size.y1 = wl->bounded_height;
 }
 
 static bool single_output_spanned(struct vo_wayland_state *wl)
@@ -4181,6 +4192,13 @@ static int update_window_title(struct vo_wayland_state *wl, const char *title)
     return VO_TRUE;
 }
 
+static void display_error(struct vo_wayland_state *wl)
+{
+    MP_FATAL(wl, "Error occurred on the display fd\n");
+    wl->display_fd = -1;
+    mp_input_put_key(wl->vo->input_ctx, MP_KEY_CLOSE_WIN);
+}
+
 static void wayland_dispatch_events(struct vo_wayland_state *wl, int nfds, int64_t timeout_ns)
 {
     if (wl->display_fd == -1)
@@ -4191,8 +4209,12 @@ static void wayland_dispatch_events(struct vo_wayland_state *wl, int nfds, int64
         {.fd = wl->wakeup_pipe[0], .events = POLLIN },
     };
 
-    while (wl_display_prepare_read(wl->display) != 0)
-        wl_display_dispatch_pending(wl->display);
+    while (wl_display_prepare_read(wl->display) != 0) {
+        if (wl_display_dispatch_pending(wl->display) < 0) {
+            display_error(wl);
+            return;
+        }
+    }
     wl_display_flush(wl->display);
 
     mp_poll(fds, nfds, timeout_ns);
@@ -4203,11 +4225,8 @@ static void wayland_dispatch_events(struct vo_wayland_state *wl, int nfds, int64
         wl_display_cancel_read(wl->display);
     }
 
-    if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        MP_FATAL(wl, "Error occurred on the display fd\n");
-        wl->display_fd = -1;
-        mp_input_put_key(wl->vo->input_ctx, MP_KEY_CLOSE_WIN);
-    }
+    if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))
+        display_error(wl);
 
     if (fds[1].revents & POLLIN)
         mp_flush_wakeup_pipe(wl->wakeup_pipe[0]);
@@ -4485,8 +4504,11 @@ void vo_wayland_handle_color(struct vo_wayland_state *wl, struct mp_image_params
         return;
     }
     wl->last_hint_params = *params;
-    if (color_space_changed)
+    if (color_space_changed) {
         set_color_management(wl, &params->color);
+    } else {
+        params->color = wl->current_params.color;
+    }
 #if HAVE_WAYLAND_PROTOCOLS_1_44
     if (color_repr_changed)
         set_color_representation(wl, params);
@@ -4683,7 +4705,8 @@ bool vo_wayland_init(struct vo *vo)
         wl->fback_pool = talloc_zero(wl, struct vo_wayland_feedback_pool);
         wl->fback_pool->wl = wl;
         wl->fback_pool->len = VO_MAX_SWAPCHAIN_DEPTH;
-        wl->fback_pool->last_zero_copy = -1,
+        wl->fback_pool->last_zero_copy = -1;
+        wl->fback_pool->last_refresh_type = -1;
         wl->fback_pool->fback = talloc_zero_array(wl->fback_pool, struct wp_presentation_feedback *,
                                                   wl->fback_pool->len);
         wl->present = mp_present_initialize(wl, wl->opts, VO_MAX_SWAPCHAIN_DEPTH);
@@ -4781,9 +4804,6 @@ bool vo_wayland_reconfig(struct vo *vo)
 
     if (wl->geometry_configured && wl->opts->auto_window_resize)
         wl->reconfigured = true;
-
-    if (wl->opts->wl_configure_bounds)
-        set_window_bounds(wl);
 
     if (wl->opts->cursor_passthrough)
         set_input_region(wl, true);

@@ -29,6 +29,8 @@
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/utils/frame_queue.h>
 
+#include "video.h"
+#include "context.h"
 #include "config.h"
 #include "common/common.h"
 #include "common/stats.h"
@@ -42,7 +44,6 @@
 #include "sub/draw_bmp.h"
 #include "video/fmt-conversion.h"
 #include "video/mp_image.h"
-#include "video/out/placebo/ra_pl.h"
 #include "video/out/placebo/utils.h"
 #include "video/out/gpu/context.h"
 #include "video/out/gpu/hwdec.h"
@@ -50,27 +51,16 @@
 #include "video/out/gpu/video.h"
 #include "video/out/gpu/video_shaders.h"
 #include "sub/osd.h"
-#include "video/out/gpu_next/context.h"
-#include "video/out/gpu_next/video.h"
 
-#if HAVE_GL && defined(PL_HAVE_OPENGL)
-#include <libplacebo/opengl.h>
-#include "video/out/opengl/ra_gl.h"
-#endif
-
-#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
-#include <libplacebo/d3d11.h>
-#include "osdep/windows_utils.h"
-#include "video/out/d3d11/ra_d3d11.h"
-#endif
 
 struct osd_entry {
     pl_tex tex;
     struct pl_overlay_part *parts;
     int num_parts;
+    int change_id;
 };
 
-struct gpu_next_osd_state {
+struct overlay_state {
     struct osd_entry entries[MAX_OSD_PARTS];
     struct pl_overlay *overlays;
     int num_overlays;
@@ -115,19 +105,17 @@ struct hwdec_slot {
     pl_tex tex[4];            // plane textures of the current mapping
 };
 
-struct gpu_next_renderer {
+struct mppl_video {
     struct mp_log *log;
     struct mpv_global *global;
     struct stats_ctx *stats;
+    struct osd_state *osd;
     struct ra_ctx *ra_ctx;
-    struct gpu_ctx *context;
     struct ra_hwdec_ctx hwdec_ctx;
     struct hwdec_slot hwdec;
     struct hwdec_slot el_hwdec;
     struct timer_pool *sw_upload_timer;
     struct mp_pass_perf sw_upload_perf;
-    bool hwdec_initialized;
-    bool dr_lock_initialized;
 
     // Allocated DR buffers
     mp_mutex dr_lock;
@@ -144,19 +132,19 @@ struct gpu_next_renderer {
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
-    struct gpu_next_osd_state osd_state;
-    struct osd_state *osd;
-    struct mp_image_params video_params;
-    int req_frames;
-    float target_ref_luma;
+    struct overlay_state osd_state;
 
     uint64_t last_id;
     uint64_t osd_sync;
     double last_pts;
     bool is_interpolated;
     bool want_reset;
+    bool want_seek_reset;
     bool flush_cache;
     bool paused;
+    int last_ref_white;
+    int last_srgb_power22;
+    int req_frames;
 
     pl_options pars;
     struct m_config_cache *opts_cache;
@@ -180,12 +168,21 @@ struct gpu_next_renderer {
     struct frame_info perf_fresh;
     struct frame_info perf_redraw;
 
+    struct mp_image_params image_params;
+
+    // Color space and reference white of the display, from mppl_video_begin_frame()
+    struct pl_color_space display_csp;
+    float display_ref_luma;
+
+    // Bits per channel of the framebuffer, 0 if unknown
+    int fb_depth;
 };
 
-static void update_render_options(struct gpu_next_renderer *p);
-static void update_lut(struct gpu_next_renderer *p, struct user_lut *lut);
+static void update_render_options(struct mppl_video *p);
+static void update_lut(struct mppl_video *p, struct user_lut *lut);
 
 struct gl_next_opts {
+    struct pl_tone_map_constants tone_constants;
     bool delayed_peak;
     int sub_hdr_peak;
     int image_subs_hdr_peak;
@@ -213,6 +210,17 @@ const struct m_opt_choice_alternatives lut_types[] = {
 #define OPT_BASE_STRUCT struct gl_next_opts
 const struct m_sub_options gl_next_conf = {
     .opts = (const struct m_option[]) {
+        {"tone-mapping-knee-adaptation", OPT_FLOAT(tone_constants.knee_adaptation), M_RANGE(0, 1)},
+        {"tone-mapping-knee-minimum", OPT_FLOAT(tone_constants.knee_minimum), M_RANGE(0, 0.5)},
+        {"tone-mapping-knee-maximum", OPT_FLOAT(tone_constants.knee_maximum), M_RANGE(0.5, 1)},
+        {"tone-mapping-knee-default", OPT_FLOAT(tone_constants.knee_default), M_RANGE(0, 1)},
+        {"tone-mapping-knee-offset", OPT_FLOAT(tone_constants.knee_offset), M_RANGE(0.5, 2)},
+        {"tone-mapping-slope-tuning", OPT_FLOAT(tone_constants.slope_tuning), M_RANGE(0, 10)},
+        {"tone-mapping-slope-offset", OPT_FLOAT(tone_constants.slope_offset), M_RANGE(0, 1)},
+        {"tone-mapping-spline-contrast", OPT_FLOAT(tone_constants.spline_contrast), M_RANGE(0, 1.5)},
+        {"tone-mapping-reinhard-contrast", OPT_FLOAT(tone_constants.reinhard_contrast), M_RANGE(0, 1)},
+        {"tone-mapping-linear-knee", OPT_FLOAT(tone_constants.linear_knee), M_RANGE(0, 1)},
+        {"tone-mapping-exposure", OPT_FLOAT(tone_constants.exposure), M_RANGE(0, 10)},
         {"sub-hdr-peak", OPT_CHOICE(sub_hdr_peak, {"auto", 0}, {"sdr", PL_COLOR_SDR_WHITE}),
             M_RANGE(10, 10000)},
         {"image-subs-hdr-peak", OPT_CHOICE(image_subs_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE},
@@ -239,6 +247,7 @@ const struct m_sub_options gl_next_conf = {
         {0},
     },
     .defaults = &(struct gl_next_opts) {
+        .tone_constants = { PL_TONE_MAP_CONSTANTS },
         .border_background = BACKGROUND_COLOR,
         .background_blur_radius = 16.0f,
         .inter_preserve = true,
@@ -250,7 +259,7 @@ const struct m_sub_options gl_next_conf = {
     .change_flags = UPDATE_VIDEO,
 };
 
-static pl_buf get_dr_buf(struct gpu_next_renderer *p, const uint8_t *ptr)
+static pl_buf get_dr_buf(struct mppl_video *p, const uint8_t *ptr)
 {
     mp_mutex_lock(&p->dr_lock);
 
@@ -268,7 +277,7 @@ static pl_buf get_dr_buf(struct gpu_next_renderer *p, const uint8_t *ptr)
 
 static void free_dr_buf(void *opaque, uint8_t *data)
 {
-    struct gpu_next_renderer *p = opaque;
+    struct mppl_video *p = opaque;
     mp_mutex_lock(&p->dr_lock);
 
     for (int i = 0; i < p->num_dr_buffers; i++) {
@@ -283,9 +292,8 @@ static void free_dr_buf(void *opaque, uint8_t *data)
     MP_ASSERT_UNREACHABLE();
 }
 
-struct mp_image *gpu_next_renderer_get_image(struct gpu_next_renderer *p,
-                                             int imgfmt, int w, int h,
-                                             int stride_align, int flags)
+struct mp_image *mppl_video_get_image(struct mppl_video *p, int imgfmt, int w, int h,
+                                      int stride_align, int flags)
 {
     pl_gpu gpu = p->gpu;
     if (!gpu->limits.thread_safe || !gpu->limits.max_mapped_size)
@@ -324,23 +332,34 @@ struct mp_image *gpu_next_renderer_get_image(struct gpu_next_renderer *p,
     return mpi;
 }
 
-static bool upload_overlay_tex(struct gpu_next_renderer *p,
-                               struct osd_entry *entry,
+static bool upload_overlay_tex(struct mppl_video *p, struct osd_entry *entry,
                                const struct sub_bitmaps *item)
 {
+    pl_fmt tex_fmt = p->osd_fmt[item->format];
     if (!entry->tex)
         MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
-    bool ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
-        .format = p->osd_fmt[item->format],
-        .w = MPMAX(item->packed_w, entry->tex ? entry->tex->params.w : 0),
-        .h = MPMAX(item->packed_h, entry->tex ? entry->tex->params.h : 0),
-        .host_writable = true,
-        .sampleable = true,
-    });
-    if (!ok) {
-        MP_ERR(p, "Failed recreating OSD texture!\n");
-        return false;
+    // pl_tex_recreate() invalidates the texture even when it keeps it, so
+    // only call it when the size or format has to change. Textures only
+    // ever grow, so a size mismatch means the texture is too small.
+    pl_tex tex = entry->tex;
+    if (!tex || tex->params.w < item->packed_w ||
+        tex->params.h < item->packed_h || tex->params.format != tex_fmt)
+    {
+        entry->change_id = 0;
+        bool ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
+            .format = tex_fmt,
+            .w = MPMAX(item->packed_w, tex ? tex->params.w : 0),
+            .h = MPMAX(item->packed_h, tex ? tex->params.h : 0),
+            .host_writable = true,
+            .sampleable = true,
+        });
+        if (!ok) {
+            MP_ERR(p, "Failed recreating OSD texture!\n");
+            return false;
+        }
     }
+    if (entry->change_id == item->change_id)
+        return true;
     struct pl_tex_transfer_params upload_params = {
         .tex        = entry->tex,
         .rc         = { .x1 = item->packed_w, .y1 = item->packed_h, },
@@ -355,13 +374,15 @@ static bool upload_overlay_tex(struct gpu_next_renderer *p,
     if (!pl_tex_upload(p->gpu, &upload_params)) {
         MP_ERR(p, "Failed uploading OSD texture!\n");
         talloc_free(upload_params.priv);
+        entry->change_id = 0;
         return false;
     }
+    entry->change_id = item->change_id;
     return true;
 }
 
 // Duplicate overlay parts for each eye in stereo 3D modes
-static void dup_stereo_parts(struct gpu_next_renderer *p, struct osd_entry *entry, int start,
+static void dup_stereo_parts(struct mppl_video *p, struct osd_entry *entry, int start,
                              struct mp_osd_res res, const int div[2])
 {
     int num_eye_parts = entry->num_parts - start;
@@ -383,7 +404,7 @@ static void dup_stereo_parts(struct gpu_next_renderer *p, struct osd_entry *entr
     }
 }
 
-static struct pl_color_space bgra_overlay_color(struct gpu_next_renderer *p,
+static struct pl_color_space bgra_overlay_color(struct mppl_video *p,
                                                 const struct sub_bitmaps *item,
                                                 const struct sub_bitmap *b,
                                                 const struct mp_image *src,
@@ -439,7 +460,7 @@ static struct pl_color_space bgra_overlay_color(struct gpu_next_renderer *p,
     return color;
 }
 
-static struct pl_color_space libass_overlay_color(struct gpu_next_renderer *p,
+static struct pl_color_space libass_overlay_color(struct mppl_video *p,
                                                   const struct sub_bitmaps *item,
                                                   const struct mp_image *src,
                                                   float ref_luma)
@@ -461,7 +482,7 @@ static struct pl_color_space libass_overlay_color(struct gpu_next_renderer *p,
     return color;
 }
 
-static void add_run_overlay(struct gpu_next_renderer *p, struct gpu_next_osd_state *state,
+static void add_run_overlay(struct mppl_video *p, struct overlay_state *state,
                             const struct osd_entry *entry,
                             const struct sub_bitmaps *item,
                             const struct pl_color_space *color, int start,
@@ -489,13 +510,12 @@ static void add_run_overlay(struct gpu_next_renderer *p, struct gpu_next_osd_sta
     }
 }
 
-static void update_overlays(struct gpu_next_renderer *p, struct mp_osd_res res,
+static void update_overlays(struct mppl_video *p, struct mp_osd_res res,
                             int flags, enum pl_overlay_coords coords,
-                            struct gpu_next_osd_state *state, struct pl_frame *frame,
+                            struct overlay_state *state, struct pl_frame *frame,
                             struct mp_image *src, int stereo_mode, float ref_luma)
 {
     state->num_overlays = 0;
-    frame->overlays = state->overlays;
     frame->num_overlays = 0;
     if (!p->osd)
         return;
@@ -505,8 +525,7 @@ static void update_overlays(struct gpu_next_renderer *p, struct mp_osd_res res,
     mp_get_3d_side_by_side(stereo_mode, div);
     res.w /= div[0];
     res.h /= div[1];
-    struct sub_bitmap_list *subs = osd_render(p->osd, res, pts, flags,
-                                              mp_draw_sub_formats);
+    struct sub_bitmap_list *subs = osd_render(p->osd, res, pts, flags, mp_draw_sub_formats);
 
     for (int n = 0; n < subs->num_items; n++) {
         const struct sub_bitmaps *item = subs->items[n];
@@ -563,8 +582,8 @@ static void update_overlays(struct gpu_next_renderer *p, struct mp_osd_res res,
 }
 
 struct frame_priv {
-    struct gpu_next_renderer *renderer;
-    struct gpu_next_osd_state subs;
+    struct mppl_video *p;
+    struct overlay_state subs;
     uint64_t osd_sync;
     struct ra_hwdec *hwdec;
     // Optional Dolby Vision FEL.
@@ -666,21 +685,17 @@ static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
     return desc.num_planes;
 }
 
-static void slot_unmap(struct gpu_next_renderer *p, struct hwdec_slot *s)
+static void slot_unmap(struct mppl_video *p, struct hwdec_slot *s)
 {
     mp_assert(!s->acquired);
     if (!s->mapper)
         return;
-    // For RAs not based on ra_pl the plane textures are wrappers we created.
-    if (!ra_pl_get(s->mapper->ra)) {
-        for (int n = 0; n < MP_ARRAY_SIZE(s->tex); n++)
-            pl_tex_destroy(p->gpu, &s->tex[n]);
-    }
-    memset(s->tex, 0, sizeof(s->tex));
+    for (int n = 0; n < MP_ARRAY_SIZE(s->tex); n++)
+        gpu_ctx_unwrap_ra_tex(p->gpu, s->mapper->ra, &s->tex[n]);
     ra_hwdec_mapper_unmap(s->mapper);
 }
 
-static bool slot_reconfig(struct gpu_next_renderer *p, struct hwdec_slot *s,
+static bool slot_reconfig(struct mppl_video *p, struct hwdec_slot *s,
                           struct ra_hwdec *hwdec,
                           const struct mp_image_params *par)
 {
@@ -708,7 +723,7 @@ static bool slot_reconfig(struct gpu_next_renderer *p, struct hwdec_slot *s,
     return true;
 }
 
-static void unmap_unused_hwdec(struct gpu_next_renderer *p, struct mp_image *image)
+static void unmap_unused_hwdec(struct mppl_video *p, struct mp_image *image)
 {
     if (!image || !ra_hwdec_get(&p->hwdec_ctx, image->imgfmt))
         slot_unmap(p, &p->hwdec);
@@ -718,52 +733,12 @@ static void unmap_unused_hwdec(struct gpu_next_renderer *p, struct mp_image *ima
         slot_unmap(p, &p->el_hwdec);
 }
 
-static void slot_uninit(struct gpu_next_renderer *p, struct hwdec_slot *s)
+static void slot_uninit(struct mppl_video *p, struct hwdec_slot *s)
 {
     slot_unmap(p, s);
     ra_hwdec_mapper_free(&s->mapper);
     timer_pool_destroy(s->timer);
     s->timer = NULL;
-}
-
-static pl_tex hwdec_get_tex(struct gpu_next_renderer *p, struct ra_hwdec_mapper *mapper, int n)
-{
-    struct ra_tex *ratex = mapper->tex[n];
-    struct ra *ra = mapper->ra;
-    if (ra_pl_get(ra))
-        return ratex->priv;
-
-#if HAVE_GL && defined(PL_HAVE_OPENGL)
-    if (ra_is_gl(ra) && pl_opengl_get(p->gpu)) {
-        struct pl_opengl_wrap_params params = {
-            .width = ratex->params.w,
-            .height = ratex->params.h,
-        };
-        ra_gl_get_format(ratex->params.format, &params.iformat,
-                         &(GLenum){0}, &(GLenum){0});
-        ra_gl_get_raw_tex(ra, ratex, &params.texture, &params.target);
-        return pl_opengl_wrap(p->gpu, &params);
-    }
-#endif
-
-#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
-    if (ra_is_d3d11(ra)) {
-        int array_slice = 0;
-        ID3D11Resource *res = ra_d3d11_get_raw_tex(ra, ratex, &array_slice);
-        pl_tex tex = pl_d3d11_wrap(p->gpu, pl_d3d11_wrap_params(
-            .tex = res,
-            .array_slice = array_slice,
-            .fmt = ra_d3d11_get_format(ratex->params.format),
-            .w = ratex->params.w,
-            .h = ratex->params.h,
-        ));
-        SAFE_RELEASE(res);
-        return tex;
-    }
-#endif
-
-    MP_ERR(p, "Failed mapping hwdec frame? Open a bug!\n");
-    return NULL;
 }
 
 // Fill `frame->num_planes` and per-plane component_mapping from an
@@ -811,12 +786,11 @@ static bool same_hwdec_frame(const struct mp_image *a, const struct mp_image *b)
     return true;
 }
 
-static bool slot_acquire(struct gpu_next_renderer *p, struct hwdec_slot *s,
-                         struct mp_image *mpi,
-                         struct pl_frame *frame)
+static bool slot_acquire(struct mppl_video *p, struct hwdec_slot *s,
+                         struct mp_image *mpi, struct pl_frame *frame)
 {
-    // A screenshot queue can hold a different reference to the same frame.
-    // Some hardware decoders cannot map a consumed output buffer twice.
+    // A screenshot queue may hold another reference to the same frame.
+    // Some hardware decoders only allow mapping an output buffer once.
     if (!same_hwdec_frame(s->mapper->src, mpi)) {
         if (s->acquired) {
             MP_ERR(p, "Hardware frame of this role is still in use.\n");
@@ -844,9 +818,11 @@ static bool slot_acquire(struct gpu_next_renderer *p, struct hwdec_slot *s,
 
     for (int n = 0; n < frame->num_planes; n++) {
         if (!s->tex[n])
-            s->tex[n] = hwdec_get_tex(p, s->mapper, n);
-        if (!s->tex[n])
+            s->tex[n] = gpu_ctx_wrap_ra_tex(p->gpu, s->mapper->ra, s->mapper->tex[n]);
+        if (!s->tex[n]) {
+            MP_ERR(p, "Failed mapping hwdec frame? Open a bug!\n");
             return false;
+        }
         frame->planes[n].texture = s->tex[n];
     }
 
@@ -865,7 +841,7 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
 {
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
-    struct gpu_next_renderer *p = fp->renderer;
+    struct mppl_video *p = fp->p;
     return slot_reconfig(p, &p->hwdec, fp->hwdec, &mpi->params) &&
            slot_acquire(p, &p->hwdec, mpi, frame);
 }
@@ -874,17 +850,16 @@ static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
 {
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
-    struct gpu_next_renderer *p = fp->renderer;
+    struct mppl_video *p = fp->p;
     slot_release(&p->hwdec);
 }
 
-#if PL_API_VER >= 367
 static bool hwdec_acquire_el(pl_gpu gpu, struct pl_frame *frame)
 {
     struct mp_image *bl_mpi = frame->user_data;
     struct mp_image *el_mpi = bl_mpi->enhancement_layer;
     struct frame_priv *fp = bl_mpi->priv;
-    struct gpu_next_renderer *p = fp->renderer;
+    struct mppl_video *p = fp->p;
     return slot_reconfig(p, &p->el_hwdec, fp->el_hwdec, &el_mpi->params) &&
            slot_acquire(p, &p->el_hwdec, el_mpi, frame);
 }
@@ -893,13 +868,11 @@ static void hwdec_release_el(pl_gpu gpu, struct pl_frame *frame)
 {
     struct mp_image *bl_mpi = frame->user_data;
     struct frame_priv *fp = bl_mpi->priv;
-    struct gpu_next_renderer *p = fp->renderer;
+    struct mppl_video *p = fp->p;
     slot_release(&p->el_hwdec);
 }
-#endif
 
-static bool format_supported(struct gpu_next_renderer *p, int format,
-                             bool use_uint)
+static bool format_supported(struct mppl_video *p, int format, bool use_uint)
 {
     struct pl_bit_encoding bits;
     struct pl_plane_data data[4] = {0};
@@ -915,72 +888,27 @@ static bool format_supported(struct gpu_next_renderer *p, int format,
     return true;
 }
 
-bool gpu_next_renderer_check_format(struct gpu_next_renderer *p, int imgfmt)
-{
-    if (ra_hwdec_get(&p->hwdec_ctx, imgfmt))
-        return true;
-
-    return format_supported(p, imgfmt, false) ||
-           format_supported(p, imgfmt, true);
-}
-
-void gpu_next_renderer_set_osd(struct gpu_next_renderer *p,
-                               struct osd_state *osd)
-{
-    p->osd = osd;
-}
-
-void gpu_next_renderer_config(struct gpu_next_renderer *p,
-                              const struct mp_image_params *params)
-{
-    mp_assert(params);
-    p->video_params = *params;
-}
-
-void gpu_next_renderer_resize(struct gpu_next_renderer *p,
-                              struct mp_rect src, struct mp_rect dst,
-                              struct mp_osd_res osd)
-{
-    if (mp_rect_equals(&p->src, &src) && mp_rect_equals(&p->dst, &dst) &&
-        osd_res_equals(p->osd_res, osd))
-        return;
-
-    p->osd_sync++;
-    p->osd_res = osd;
-    p->src = src;
-    p->dst = dst;
-}
-
-void gpu_next_renderer_get_queue_params(struct gpu_next_renderer *p,
-                                        int *req_frames, int *max_frames)
-{
-    *req_frames = p->req_frames;
-    *max_frames = 2 * p->req_frames - 1;
-}
-
 // Effective reference white luminance in nits to assume for SDR content.
-static float get_ref_luma(struct gpu_next_renderer *p)
+static float get_ref_luma(struct mppl_video *p)
 {
     const struct gl_video_opts *opts = p->opts_cache->opts;
     if (opts->hdr_reference_white)
         return opts->hdr_reference_white;
 
-    return p->target_ref_luma;
+    // auto: follow the system reference white, if available
+    return p->display_ref_luma;
 }
 
 static bool use_ref_luma(const struct pl_color_space *csp, const struct pl_color_space *target_csp)
 {
     if (!pl_color_transfer_is_hdr(csp->transfer))
         return true;
-#if PL_API_VER >= 362
     if (csp->transfer == PL_COLOR_TRC_SCRGB && target_csp && !pl_color_transfer_is_hdr(target_csp->transfer))
         return true;
-#endif
     return false;
 }
 
-static bool upload_planes_sw(struct gpu_next_renderer *p, pl_gpu gpu,
-                             struct mp_image *mpi,
+static bool upload_planes_sw(struct mppl_video *p, pl_gpu gpu, struct mp_image *mpi,
                              struct pl_frame *frame, pl_tex tex[4])
 {
     struct pl_plane_data data[4] = {0};
@@ -1038,7 +966,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     struct mp_image *mpi = src->frame_data;
     struct mp_image_params par = mpi->params;
     struct frame_priv *fp = mpi->priv;
-    struct gpu_next_renderer *p = fp->renderer;
+    struct mppl_video *p = fp->p;
 
     fp->hwdec = ra_hwdec_get(&p->hwdec_ctx, mpi->imgfmt);
     if (fp->hwdec) {
@@ -1107,7 +1035,6 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     // Update chroma location, must be done after initializing planes
     pl_frame_set_chroma_location(frame, par.chroma_location);
 
-#if PL_API_VER >= 367
     if (mpi->enhancement_layer) {
         struct mp_image *el = mpi->enhancement_layer;
         fp->el_hwdec = ra_hwdec_get(&p->hwdec_ctx, el->imgfmt);
@@ -1147,7 +1074,6 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
                     "rendering base layer only.\n");
         }
     }
-#endif
 
     if (mpi->film_grain)
         pl_film_grain_from_av(&frame->film_grain, (AVFilmGrainParams *) mpi->film_grain->data);
@@ -1170,7 +1096,7 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
 {
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
-    struct gpu_next_renderer *p = fp->renderer;
+    struct mppl_video *p = fp->p;
     for (int i = 0; i < MP_ARRAY_SIZE(fp->subs.entries); i++) {
         pl_tex tex = fp->subs.entries[i].tex;
         if (tex)
@@ -1191,7 +1117,7 @@ static void discard_frame(const struct pl_source_frame *src)
 
 static void info_callback(void *priv, const struct pl_render_info *info)
 {
-    struct gpu_next_renderer *p = priv;
+    struct mppl_video *p = priv;
     if (info->index >= VO_PASS_PERF_MAX)
         return; // silently ignore clipped passes, whatever
 
@@ -1206,7 +1132,7 @@ static void info_callback(void *priv, const struct pl_render_info *info)
     pl_dispatch_info_move(&frame->info[info->index], info->pass);
 }
 
-static void update_options(struct gpu_next_renderer *p)
+static void update_options(struct mppl_video *p)
 {
     pl_options pars = p->pars;
     bool changed = m_config_cache_update(p->opts_cache);
@@ -1233,7 +1159,8 @@ static void update_options(struct gpu_next_renderer *p)
         pl_options_set_str(pars, kv[0], kv[1]);
 }
 
-static void apply_target_contrast(struct gpu_next_renderer *p, struct pl_color_space *color, float min_luma)
+static void apply_target_contrast(struct mppl_video *p, struct pl_color_space *color,
+                                  float min_luma)
 {
     const struct gl_video_opts *opts = p->opts_cache->opts;
 
@@ -1262,10 +1189,9 @@ static void apply_target_contrast(struct gpu_next_renderer *p, struct pl_color_s
     color->hdr.min_luma = color->hdr.max_luma / opts->target_contrast;
 }
 
-static void apply_target_options(struct gpu_next_renderer *p, struct pl_frame *target,
+static void apply_target_options(struct mppl_video *p, struct pl_frame *target,
                                  float min_luma, bool hint, float target_ref_luma,
-                                 const struct pl_color_space *target_csp,
-                                 int fb_depth)
+                                 const struct pl_color_space *target_csp)
 {
     update_lut(p, &p->next_opts->target_lut);
     target->lut = p->next_opts->target_lut.lut;
@@ -1292,12 +1218,10 @@ static void apply_target_options(struct gpu_next_renderer *p, struct pl_frame *t
         mp_parse_raw_primaries(mp_null_log, opts->target_gamut, &target->color.hdr.prim);
     int dither_depth = opts->dither_depth;
     if (dither_depth == 0)
-        dither_depth = fb_depth ? fb_depth : target->repr.bits.color_depth;
-#if PL_API_VER >= 362
+        dither_depth = p->fb_depth;
     // Don't dither scRGB, assume downstream will handle quantization properly.
     if (target->color.transfer == PL_COLOR_TRC_SCRGB)
         dither_depth = -1;
-#endif
     if (dither_depth > 0) {
         struct pl_bit_encoding *tbits = &target->repr.bits;
         tbits->color_depth += dither_depth - tbits->sample_depth;
@@ -1342,6 +1266,11 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
     }
 }
 
+enum pl_color_levels mppl_video_get_output_levels(struct mppl_video *p)
+{
+    return p->output_levels ? p->output_levels : PL_COLOR_LEVELS_FULL;
+}
+
 static void update_tm_viz(struct pl_color_map_params *params,
                           const struct pl_frame *target)
 {
@@ -1363,24 +1292,51 @@ static void update_tm_viz(struct pl_color_map_params *params,
     params->visualize_hue = M_PI / 4.0;
 }
 
-static void update_hook_opts_dynamic(struct gpu_next_renderer *p, const struct pl_hook *hook,
+static void update_hook_opts_dynamic(struct mppl_video *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi);
 
-static bool can_interpolate(struct gpu_next_renderer *p,
-                            const struct vo_frame *frame)
+// Render parameters and timing of a frame
+struct frame_params {
+    struct pl_render_params params;
+    bool can_interpolate;
+    double pts_offset;
+};
+
+static struct frame_params get_frame_params(struct mppl_video *p, struct vo_frame *frame)
 {
+    pl_options pars = p->pars;
+    struct pl_render_params params = pars->params;
     const struct gl_video_opts *opts = p->opts_cache->opts;
-    return opts->interpolation && frame->display_synced && !frame->still &&
-           frame->num_frames > 1 && !p->paused;
+    bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
+    bool cache_frame = will_redraw || frame->still || p->paused;
+    bool can_interpolate = opts->interpolation && frame->display_synced &&
+                           !frame->still && frame->num_frames > 1 && !p->paused;
+    double pts_offset = can_interpolate ? frame->ideal_frame_vsync : 0;
+    params.info_callback = info_callback;
+    params.info_priv = p;
+    params.skip_caching_single_frame = !cache_frame;
+    params.preserve_mixing_cache = p->next_opts->inter_preserve && !frame->still;
+    if (frame->still || p->paused)
+        params.frame_mixer = NULL;
+
+    if (frame->current && frame->current->params.vflip) {
+        pl_matrix2x2 m = { .m = {{1, 0}, {0, -1}}, };
+        pars->distort_params.transform.mat = m;
+        params.distort_params = &pars->distort_params;
+    } else {
+        params.distort_params = NULL;
+    }
+
+    return (struct frame_params){ params, can_interpolate, pts_offset };
 }
 
-static void push_frame(struct gpu_next_renderer *p, pl_queue queue,
+static void push_frame(struct mppl_video *p, pl_queue queue,
                        struct mp_image *image, float duration)
 {
     struct mp_image *mpi = mp_image_new_ref(image);
     struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
     mpi->priv = fp;
-    fp->renderer = p;
+    fp->p = p;
 
     pl_queue_push(queue, &(struct pl_source_frame) {
         .pts = mpi->pts,
@@ -1392,10 +1348,24 @@ static void push_frame(struct gpu_next_renderer *p, pl_queue queue,
     });
 }
 
-static void enqueue_frames(struct gpu_next_renderer *p, struct vo_frame *frame,
-                           bool can_interpolate)
+void mppl_video_begin_frame(struct mppl_video *p, struct vo_frame *frame,
+                            struct pl_color_space display_csp, float display_ref_luma)
 {
-    double pts_offset = can_interpolate ? frame->ideal_frame_vsync : 0;
+    update_options(p);
+    unmap_unused_hwdec(p, frame->current);
+    p->display_csp = display_csp;
+    p->display_ref_luma = display_ref_luma;
+
+    struct frame_params fpar = get_frame_params(p, frame);
+    bool can_interpolate = fpar.can_interpolate;
+    double pts_offset = fpar.pts_offset;
+
+    // Frames up to last_id were pushed before the seek. Redraws of them keep
+    // the queue as it is, the reset happens with the first new frame.
+    if (p->want_seek_reset && frame->num_frames && frame->frame_id > p->last_id) {
+        p->want_seek_reset = false;
+        p->want_reset = true;
+    }
 
     // pl_queue advances its internal virtual PTS and culls available frames
     // based on this value and the VPS/FPS ratio. Requesting a non-monotonic PTS
@@ -1407,7 +1377,7 @@ static void enqueue_frames(struct gpu_next_renderer *p, struct vo_frame *frame,
     // already requested. Clamp the check to 0, as we don't have the previous
     // frame in vo_frame anyway.
     struct pl_source_frame vpts;
-    if (frame->current && !p->want_reset) {
+    if (frame->current && !p->want_reset && !p->want_seek_reset) {
         if (pl_queue_peek(p->queue, 0, &vpts) &&
             frame->current->pts + MPMAX(0, pts_offset) < vpts.pts)
         {
@@ -1418,6 +1388,7 @@ static void enqueue_frames(struct gpu_next_renderer *p, struct vo_frame *frame,
         }
     }
 
+    // Push all incoming frames into the frame queue
     for (int n = 0; n < frame->num_frames; n++) {
         int id = frame->frame_id + n;
 
@@ -1435,33 +1406,18 @@ static void enqueue_frames(struct gpu_next_renderer *p, struct vo_frame *frame,
         }
 
         if (id <= p->last_id)
-            continue;
+            continue; // ignore already seen frames
 
         push_frame(p, p->queue, frame->frames[n],
                    can_interpolate ? frame->approx_duration : 0);
-
         p->last_id = id;
     }
 }
 
-void gpu_next_renderer_prepare(struct gpu_next_renderer *p,
-                               struct vo_frame *frame,
-                               struct pl_color_space target_csp,
-                               float reference_luminance,
-                               bool target_hint_supported,
-                               struct gpu_next_target *target,
-                               struct mp_image_params *hint_params)
+static struct pl_color_space get_target_csp(struct mppl_video *p, bool *unknown, float *ref_luma)
 {
-    update_options(p);
-    unmap_unused_hwdec(p, frame->current);
-
     const struct gl_video_opts *opts = p->opts_cache->opts;
-    if (opts->hdr_reference_white)
-        reference_luminance = opts->hdr_reference_white;
-    bool interpolate = can_interpolate(p, frame);
-
-    enqueue_frames(p, frame, interpolate);
-
+    struct pl_color_space target_csp = p->display_csp;
     if (target_csp.primaries == PL_COLOR_PRIM_UNKNOWN)
         target_csp.primaries = mp_get_best_prim_container(&target_csp.hdr.prim);
     if (!pl_color_transfer_is_hdr(target_csp.transfer)) {
@@ -1473,113 +1429,125 @@ void gpu_next_renderer_prepare(struct gpu_next_renderer *p,
     // reports it as maxFALL directly, but this doesn't mean the same thing.
     target_csp.hdr.max_fall = 0;
 
-    *target = (struct gpu_next_target) {
-        .color_space = target_csp,
-        .reference_luminance = reference_luminance,
-    };
-    struct pl_color_space *hint = &target->hint;
-    bool target_hint = target_hint_supported &&
-                       (p->next_opts->target_hint == 1 ||
-                        (p->next_opts->target_hint == -1 &&
-                         target_csp.transfer != PL_COLOR_TRC_UNKNOWN));
     // Assume HDR is supported, if target_csp() is not available
     // TODO: Remove this fallback when all backends support target_csp()
     bool target_unknown = target_csp.transfer == PL_COLOR_TRC_UNKNOWN;
+    float target_ref_luma = 0;
     if (target_unknown) {
         target_csp = (struct pl_color_space){
             .transfer = opts->target_trc ? opts->target_trc : pl_color_space_hdr10.transfer };
+    } else {
+        target_ref_luma = get_ref_luma(p);
     }
-    target->color_space = target_csp;
-    target->unknown = target_unknown;
-    target->hint_enabled = target_hint;
-    target->reference_luminance = target_unknown ? 0 : reference_luminance;
-    p->target_ref_luma = target_unknown ? 0 : reference_luminance;
+
+    *unknown = target_unknown;
+    *ref_luma = target_ref_luma;
+    return target_csp;
+}
+
+enum mppl_video_hint mppl_video_get_target_hint(struct mppl_video *p, struct vo_frame *frame,
+                                                struct pl_color_space *out_hint)
+{
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+    bool target_unknown;
+    float target_ref_luma;
+    struct pl_color_space target_csp = get_target_csp(p, &target_unknown, &target_ref_luma);
+
+    struct pl_color_space hint = {0};
+    bool target_hint = p->next_opts->target_hint == 1 ||
+                       (p->next_opts->target_hint == -1 && !target_unknown);
     if (target_hint && frame->current) {
         const struct pl_color_space *source = &frame->current->params.color;
-        const struct pl_color_space *detected = &target_csp;
-        *hint = *source;
+        const struct pl_color_space *target = &target_csp;
+        hint = *source;
         // Apply target contrast to the hint, this is important for SDR, because
         // libplacebo defaults to 1000:1 contrast ratio otherwise.
-        if (!hint->hdr.min_luma)
-            hint->hdr.min_luma = detected->hdr.min_luma;
+        if (!hint.hdr.min_luma)
+            hint.hdr.min_luma = target->hdr.min_luma;
         if (p->next_opts->target_hint_mode == 0) {
-            *hint = *detected;
-            if (pl_color_transfer_is_hdr(hint->transfer) && !pl_primaries_valid(&hint->hdr.prim))
-                pl_color_space_merge(hint, source);
+            hint = *target;
+            if (pl_color_transfer_is_hdr(hint.transfer) && !pl_primaries_valid(&hint.hdr.prim))
+                pl_color_space_merge(&hint, source);
             if (target_unknown && !opts->target_trc && !pl_color_transfer_is_hdr(source->transfer))
-                *hint = *source;
+                hint = *source;
             // Restore target luminance if it was present, note that we check
             // max_luma only, this make sure that max_cll/max_fall is not take
             // from source.
-            if (detected->hdr.max_luma) {
-                hint->hdr.max_luma = detected->hdr.max_luma;
-                hint->hdr.min_luma = detected->hdr.min_luma;
-                hint->hdr.max_cll  = detected->hdr.max_cll;
-                hint->hdr.max_fall = detected->hdr.max_fall;
+            if (target->hdr.max_luma) {
+                hint.hdr.max_luma = target->hdr.max_luma;
+                hint.hdr.min_luma = target->hdr.min_luma;
+                hint.hdr.max_cll  = target->hdr.max_cll;
+                hint.hdr.max_fall = target->hdr.max_fall;
             }
         }
         if (p->next_opts->target_hint_mode == 2) { // source-dynamic
             pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
-                .color      = hint,
+                .color      = &hint,
                 .metadata   = PL_HDR_METADATA_ANY,
                 .scaling    = PL_HDR_NITS,
-                .out_min    = !hint->hdr.min_luma ? &hint->hdr.min_luma : NULL,
-                .out_max    = &hint->hdr.max_luma,
+                .out_min    = !hint.hdr.min_luma ? &hint.hdr.min_luma : NULL,
+                .out_max    = &hint.hdr.max_luma,
             ));
             // Set maxCLL to dynamic max luminance. Note that libplacebo uses
             // max luminace as maxCLL in practice.
-            hint->hdr.max_cll = hint->hdr.max_luma;
+            hint.hdr.max_cll = hint.hdr.max_luma;
             // Keep maxFALL from static metadata, unless its value is too high.
             // Could be set to 0, but let's keep it for now.
-            if (hint->hdr.max_fall > hint->hdr.max_cll)
-                hint->hdr.max_fall = 0;
+            if (hint.hdr.max_fall > hint.hdr.max_cll)
+                hint.hdr.max_fall = 0;
         }
         // Infer missing bits now. This is important so that we don't lose
         // information after user option overrides. For example, if the user
         // sets target_trc to PQ, but the hint(source) is SDR, we want to fill
         // in SDR luminance values instead of the default PQ range.
         struct pl_color_space source_csp = *source;
-        pl_color_space_infer_map(&source_csp, hint);
+        bool min_luma_known = hint.hdr.min_luma > 0;
+        pl_color_space_infer_map(&source_csp, &hint);
         // Always prefer target luminance and transfer for inverse tone mapping
-        if (pl_color_transfer_is_hdr(detected->transfer) && opts->tone_map.inverse) {
-            hint->transfer     = detected->transfer;
-            hint->hdr.max_luma = detected->hdr.max_luma;
-            hint->hdr.min_luma = detected->hdr.min_luma;
-            hint->hdr.max_cll  = detected->hdr.max_cll;
-            hint->hdr.max_fall = detected->hdr.max_fall;
+        if (pl_color_transfer_is_hdr(target->transfer) && opts->tone_map.inverse) {
+            hint.transfer     = target->transfer;
+            hint.hdr.max_luma = target->hdr.max_luma;
+            hint.hdr.min_luma = target->hdr.min_luma;
+            hint.hdr.max_cll  = target->hdr.max_cll;
+            hint.hdr.max_fall = target->hdr.max_fall;
         }
         if (opts->target_prim)
-            hint->primaries = opts->target_prim;
+            hint.primaries = opts->target_prim;
         if (opts->target_gamut)
-            mp_parse_raw_primaries(mp_null_log, opts->target_gamut, &hint->hdr.prim);
+            mp_parse_raw_primaries(mp_null_log, opts->target_gamut, &hint.hdr.prim);
         if (opts->target_trc)
-            hint->transfer = opts->target_trc;
+            hint.transfer = opts->target_trc;
         if (opts->target_peak)
-            hint->hdr.max_luma = opts->target_peak;
-        if (reference_luminance && use_ref_luma(hint, &target_csp))
-            hint->hdr.max_luma = reference_luminance;
+            hint.hdr.max_luma = opts->target_peak;
+        if (target_ref_luma && use_ref_luma(&hint, &target_csp))
+            hint.hdr.max_luma = target_ref_luma;
+        // The SDR black point was inferred from the peak known before the
+        // overrides above, keep the assumed contrast relative to the final
+        // peak instead of the one it was inferred from.
+        if (!min_luma_known && !pl_color_transfer_is_hdr(hint.transfer))
+            hint.hdr.min_luma = hint.hdr.max_luma / PL_COLOR_SDR_CONTRAST;
         // Always set maxCLL, display uses this metadata and we shouldn't let it
         // fallback to default value.
-        if (!hint->hdr.max_cll)
-            hint->hdr.max_cll = hint->hdr.max_luma;
+        if (!hint.hdr.max_cll)
+            hint.hdr.max_cll = hint.hdr.max_luma;
         // If tone mapping is required, adjust maxCLL and maxFALL
-        if (source->hdr.max_luma > hint->hdr.max_luma || opts->tone_map.inverse) {
+        if (source->hdr.max_luma > hint.hdr.max_luma || opts->tone_map.inverse) {
             // Set maxCLL to the target luminance if it's not already lower
-            if (!hint->hdr.max_cll || hint->hdr.max_luma < hint->hdr.max_cll || opts->tone_map.inverse)
-                hint->hdr.max_cll = hint->hdr.max_luma;
+            if (!hint.hdr.max_cll || hint.hdr.max_luma < hint.hdr.max_cll || opts->tone_map.inverse)
+                hint.hdr.max_cll = hint.hdr.max_luma;
             // There's no reliable way to estimate maxFALL here
-            hint->hdr.max_fall = 0;
+            hint.hdr.max_fall = 0;
         }
-        if (hint->hdr.max_cll && hint->hdr.max_fall > hint->hdr.max_cll)
-            hint->hdr.max_fall = 0;
-        apply_target_contrast(p, hint, hint->hdr.min_luma);
+        if (hint.hdr.max_cll && hint.hdr.max_fall > hint.hdr.max_cll)
+            hint.hdr.max_fall = 0;
+        apply_target_contrast(p, &hint, hint.hdr.min_luma);
         if (p->icc_profile)
-            *hint = p->icc_profile->csp;
+            hint = p->icc_profile->csp;
         if (opts->icc_opts->icc_use_luma) {
             p->icc_params.max_luma = 0.0f;
         } else {
             pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
-                .color    = hint,
+                .color    = &hint,
                 .metadata = PL_HDR_METADATA_HDR10, // use only static HDR nits
                 .scaling  = PL_HDR_NITS,
                 .out_max  = &p->icc_params.max_luma,
@@ -1588,92 +1556,65 @@ void gpu_next_renderer_prepare(struct gpu_next_renderer *p,
         pl_icc_update(p->pllog, &p->icc_profile, NULL, &p->icc_params);
         // Update again after possible max_luma change
         if (p->icc_profile)
-            *hint = p->icc_profile->csp;
-        target->hint_action = GPU_NEXT_HINT_SET;
-    } else if (!target_hint) {
-        if (!hint->hdr.min_luma)
-            hint->hdr.min_luma = target_csp.hdr.min_luma;
-        target->hint_action = GPU_NEXT_HINT_CLEAR;
+            hint = p->icc_profile->csp;
+        *out_hint = hint;
+        return MPPL_VIDEO_HINT_SET;
     }
 
-    *hint_params = (struct mp_image_params) {
-        .color = *hint,
-        .repr = {
-            .sys = PL_COLOR_SYSTEM_RGB,
-            .levels = p->output_levels ? p->output_levels : PL_COLOR_LEVELS_FULL,
-            .alpha = p->ra_ctx->opts.want_alpha ? PL_ALPHA_INDEPENDENT
-                                                : PL_ALPHA_NONE,
-        },
-    };
+    return target_hint ? MPPL_VIDEO_HINT_KEEP : MPPL_VIDEO_HINT_NONE;
 }
 
-void gpu_next_renderer_skip_frame(struct gpu_next_renderer *p,
-                                  struct vo_frame *frame)
+bool mppl_video_get_hdr_metadata(struct mppl_video *p, struct pl_hdr_metadata *out)
 {
-    unmap_unused_hwdec(p, frame->current);
-    bool interpolate = can_interpolate(p, frame);
-    double pts_offset = interpolate ? frame->ideal_frame_vsync : 0;
-    struct pl_render_params params = p->pars->params;
-    if (frame->still || p->paused)
-        params.frame_mixer = NULL;
+    return pl_renderer_get_hdr_metadata(p->rr, out);
+}
+
+void mppl_video_skip_frame(struct mppl_video *p, struct vo_frame *frame)
+{
+    struct frame_params fpar = get_frame_params(p, frame);
     if (frame->current) {
         // Advance the queue state to the current PTS to discard unused frames
         struct pl_queue_params qparams = *pl_queue_params(
-            .pts = frame->current->pts + pts_offset,
-            .radius = pl_frame_mix_radius(&params),
-            .vsync_duration = interpolate ? frame->ideal_frame_vsync_duration : 0,
+            .pts = frame->current->pts + fpar.pts_offset,
+            .radius = pl_frame_mix_radius(&fpar.params),
+            .vsync_duration = fpar.can_interpolate ? frame->ideal_frame_vsync_duration : 0,
             .drift_compensation = 0,
         );
         pl_queue_update(p->queue, NULL, &qparams);
     }
 }
 
-bool gpu_next_renderer_render(struct gpu_next_renderer *p,
-                              struct vo_frame *frame, struct pl_frame *target_frame,
-                              const struct gpu_next_target *target_state,
-                              struct gpu_next_render_result *result)
+// Render a frame to a target. hint is the color space requested for the
+// target when hinting is in use, NULL otherwise.
+bool mppl_video_render_frame(struct mppl_video *p, struct vo_frame *frame,
+                             const struct pl_frame *target_frame, int fb_depth,
+                             const struct pl_color_space *hint,
+                             struct mp_image_params *target_params)
 {
+    p->fb_depth = fb_depth;
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
-    struct pl_render_params params = pars->params;
     const struct gl_video_opts *opts = p->opts_cache->opts;
-    bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
-    bool cache_frame = will_redraw || frame->still || p->paused;
-    bool interpolate = can_interpolate(p, frame);
-    double pts_offset = interpolate ? frame->ideal_frame_vsync : 0;
-    params.info_callback = info_callback;
-    params.info_priv = p;
-    params.skip_caching_single_frame = !cache_frame;
-    params.preserve_mixing_cache = p->next_opts->inter_preserve && !frame->still;
-    if (frame->still || p->paused)
-        params.frame_mixer = NULL;
+    struct frame_params fpar = get_frame_params(p, frame);
+    struct pl_render_params params = fpar.params;
+    bool can_interpolate = fpar.can_interpolate;
+    double pts_offset = fpar.pts_offset;
 
-    if (frame->current && frame->current->params.vflip) {
-        pl_matrix2x2 m = { .m = {{1, 0}, {0, -1}}, };
-        pars->distort_params.transform.mat = m;
-        params.distort_params = &pars->distort_params;
-    } else {
-        params.distort_params = NULL;
-    }
-
-    struct pl_frame target = *target_frame;
-    pl_tex target_tex = target.planes[0].texture;
+    bool target_unknown;
+    float target_ref_luma;
+    struct pl_color_space target_csp = get_target_csp(p, &target_unknown, &target_ref_luma);
 
     bool valid = false;
     p->is_interpolated = false;
 
     // Calculate target
-    if (target_state->external_params)
-        target.color = target_state->hint;
-    bool strict_sw_params = target_state->hint_enabled &&
-                            p->next_opts->target_hint_strict;
-    apply_target_options(p, &target, target_state->hint.hdr.min_luma,
-                         strict_sw_params, target_state->reference_luminance,
-                         &target_state->color_space, target_state->dither_depth);
+    struct pl_frame target = *target_frame;
+    pl_tex target_tex = target.planes[0].texture;
+    bool strict_sw_params = hint && p->next_opts->target_hint_strict;
+    apply_target_options(p, &target, hint ? hint->hdr.min_luma : target_csp.hdr.min_luma,
+                         strict_sw_params, target_ref_luma, &target_csp);
     bool clip_gamut = pl_primaries_valid(&target.color.hdr.prim);
-#if PL_API_VER >= 362
     clip_gamut = clip_gamut && target.color.transfer != PL_COLOR_TRC_SCRGB;
-#endif
     if (clip_gamut) {
         // Ensure resulting gamut still fits inside container
         target.color.hdr.prim = pl_primaries_clip(&target.color.hdr.prim,
@@ -1713,8 +1654,7 @@ bool gpu_next_renderer_render(struct gpu_next_renderer *p,
         // Note: Older Windows versions, without ACM, were not able to convert
         // sRGB to PQ output. We are not concerned about this case, as it would
         // look wrong anyway.
-        bool target_pq = !target_state->unknown &&
-                         target_state->color_space.transfer == PL_COLOR_TRC_PQ;
+        bool target_pq = !target_unknown && target_csp.transfer == PL_COLOR_TRC_PQ;
         if (opts->treat_srgb_as_power22 & 4 && target_pq)
             target.color.transfer = PL_COLOR_TRC_SRGB;
 #endif
@@ -1734,7 +1674,7 @@ bool gpu_next_renderer_render(struct gpu_next_renderer *p,
         struct pl_queue_params qparams = *pl_queue_params(
             .pts = frame->current->pts + pts_offset,
             .radius = pl_frame_mix_radius(&params),
-            .vsync_duration = interpolate ? frame->ideal_frame_vsync_duration : 0,
+            .vsync_duration = can_interpolate ? frame->ideal_frame_vsync_duration : 0,
             .interpolation_threshold = opts->interpolation_threshold,
             .drift_compensation = 0,
         );
@@ -1776,7 +1716,7 @@ bool gpu_next_renderer_render(struct gpu_next_renderer *p,
             struct pl_frame *image = (struct pl_frame *) mix.frames[i];
             struct mp_image *mpi = image->user_data;
             struct frame_priv *fp = mpi->priv;
-            apply_crop(image, p->src, p->video_params.w, p->video_params.h);
+            apply_crop(image, p->src, p->image_params.w, p->image_params.h);
             if (opts->blend_subs) {
                 if (frame->redraw)
                     p->osd_sync++;
@@ -1789,9 +1729,9 @@ bool gpu_next_renderer_render(struct gpu_next_renderer *p,
                         .w = w,
                         .h = h,
                         .ml = -image->crop.x0 * rx,
-                        .mr = (image->crop.x1 - p->video_params.w) * rx,
+                        .mr = (image->crop.x1 - p->image_params.w) * rx,
                         .mt = -image->crop.y0 * ry,
-                        .mb = (image->crop.y1 - p->video_params.h) * ry,
+                        .mb = (image->crop.y1 - p->image_params.h) * ry,
                         .display_par = 1.0,
                     };
                     enum pl_overlay_coords rel = opts->blend_subs == BLEND_SUBS_VIDEO
@@ -1833,24 +1773,21 @@ bool gpu_next_renderer_render(struct gpu_next_renderer *p,
         goto done;
     }
 
-    struct pl_frame ref_frame;
-    pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
-
-    result->target_params = (struct mp_image_params){
-        .imgfmt_name = target_tex->params.format
-                        ? target_tex->params.format->name : NULL,
-        .w = mp_rect_w(p->dst),
-        .h = mp_rect_h(p->dst),
-        .color = target.color,
-        .repr = target.repr,
-        .rotate = target.rotation,
-    };
-    result->hdr = frame->current ? frame->current->params.color.hdr
-                                 : p->video_params.color.hdr;
-    result->has_peak = pl_renderer_get_hdr_metadata(p->rr, &result->hdr);
+    if (target_params) {
+        struct pl_frame ref_frame;
+        pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
+        *target_params = (struct mp_image_params){
+            .imgfmt_name = target_tex->params.format
+                            ? target_tex->params.format->name : NULL,
+            .w = mp_rect_w(p->dst),
+            .h = mp_rect_h(p->dst),
+            .color = target.color,
+            .repr = target.repr,
+            .rotate = target.rotation,
+        };
+    }
 
     p->is_interpolated = pts_offset != 0 && mix.num_frames > 1;
-    result->interpolated = p->is_interpolated;
     valid = true;
     // fall through
 
@@ -1862,8 +1799,39 @@ done:
     return valid;
 }
 
+bool mppl_video_check_format(struct mppl_video *p, int format)
+{
+    if (ra_hwdec_get(&p->hwdec_ctx, format))
+        return true;
+
+    bool supported = format_supported(p, format, false);
+    if (!supported)
+        supported = format_supported(p, format, true);
+
+    return supported;
+}
+
+void mppl_video_resize(struct mppl_video *p, struct mp_rect src, struct mp_rect dst,
+                       struct mp_osd_res osd)
+{
+    if (mp_rect_equals(&p->src, &src) &&
+        mp_rect_equals(&p->dst, &dst) &&
+        osd_res_equals(p->osd_res, osd))
+        return;
+
+    p->osd_sync++;
+    p->osd_res = osd;
+    p->src = src;
+    p->dst = dst;
+}
+
+void mppl_video_config(struct mppl_video *p, struct mp_image_params *params)
+{
+    p->image_params = *params;
+}
+
 // Takes over ownership of `icc`. Can be used to unload profile (icc.len == 0)
-bool gpu_next_renderer_set_icc_profile(struct gpu_next_renderer *p, bstr icc)
+bool mppl_video_set_icc_profile(struct mppl_video *p, struct bstr icc)
 {
     struct pl_icc_profile profile = {
         .data = icc.start,
@@ -1877,9 +1845,14 @@ bool gpu_next_renderer_set_icc_profile(struct gpu_next_renderer *p, bstr icc)
     return ok;
 }
 
-void gpu_next_renderer_screenshot(struct gpu_next_renderer *p,
-                                  struct vo_frame *frame,
-                                  struct voctrl_screenshot *args)
+bool mppl_video_icc_auto_enabled(struct mppl_video *p)
+{
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+    return opts->icc_opts && opts->icc_opts->profile_auto && !p->icc_path;
+}
+
+void mppl_video_screenshot(struct mppl_video *p, struct vo_frame *frame,
+                           struct voctrl_screenshot *args)
 {
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
@@ -1899,8 +1872,7 @@ void gpu_next_renderer_screenshot(struct gpu_next_renderer *p,
         }
         queue = screenshot_queue;
         pts = frame->current->pts;
-        push_frame(p, queue, frame->current,
-                   can_interpolate(p, frame) ? frame->approx_duration : 0);
+        push_frame(p, queue, frame->current, 0);
     }
     struct pl_render_params params = pars->params;
     params.info_callback = NULL;
@@ -2017,7 +1989,7 @@ void gpu_next_renderer_screenshot(struct gpu_next_renderer *p,
     const struct gl_video_opts *opts = p->opts_cache->opts;
     if (args->scaled) {
         // Apply target LUT, ICC profile and CSP override only in window mode
-        apply_target_options(p, &target, 0, false, 0, NULL, 0);
+        apply_target_options(p, &target, 0, false, 0, NULL);
     } else if (args->native_csp) {
         target.color = image.color;
     } else {
@@ -2055,9 +2027,9 @@ void gpu_next_renderer_screenshot(struct gpu_next_renderer *p,
             .w = w,
             .h = h,
             .ml = -image.crop.x0 * rx,
-            .mr = (image.crop.x1 - p->video_params.w) * rx,
+            .mr = (image.crop.x1 - p->image_params.w) * rx,
             .mt = -image.crop.y0 * ry,
-            .mb = (image.crop.y1 - p->video_params.h) * ry,
+            .mb = (image.crop.y1 - p->image_params.h) * ry,
             .display_par = 1.0,
         };
         enum pl_overlay_coords rel = opts->blend_subs == BLEND_SUBS_VIDEO
@@ -2149,76 +2121,76 @@ static inline void copy_frame_info_to_mp(struct frame_info *pl,
     mp->count = perf - mp->perf;
 }
 
-bool gpu_next_renderer_want_alpha(struct gpu_next_renderer *p)
+static bool want_alpha(const struct gl_video_opts *gl_opts, const struct gl_next_opts *next_opts)
 {
-    struct gl_video_opts *gl_opts = p->opts_cache->opts;
-    bool border_alpha = (p->next_opts->border_background == BACKGROUND_COLOR &&
+    bool border_alpha = (next_opts->border_background == BACKGROUND_COLOR &&
                          gl_opts->background_color.a != 255) ||
-                         p->next_opts->border_background == BACKGROUND_NONE;
+                         next_opts->border_background == BACKGROUND_NONE;
     return (gl_opts->background == BACKGROUND_COLOR &&
             gl_opts->background_color.a != 255) ||
-           gl_opts->background == BACKGROUND_NONE || border_alpha;
+            gl_opts->background == BACKGROUND_NONE ||
+            border_alpha;
 }
 
-bool gpu_next_renderer_use_auto_icc(struct gpu_next_renderer *p)
+bool mppl_video_want_alpha(struct mppl_video *p)
 {
-    const struct gl_video_opts *opts = p->opts_cache->opts;
-    return opts->icc_opts && opts->icc_opts->profile_auto && !p->icc_path;
+    return want_alpha(p->opts_cache->opts, p->next_opts);
 }
 
-void gpu_next_update_ra_ctx_opts(void *parent, struct mpv_global *global,
-                                 struct ra_ctx_opts *ctx_opts)
+// For the context, which is created before the renderer and its option cache
+bool mppl_video_opts_want_alpha(struct mpv_global *global)
 {
-    void *tmp = talloc_new(parent);
-    struct m_config_cache *opts_cache =
-        m_config_cache_alloc(tmp, global, &gl_video_conf);
-    struct m_config_cache *next_opts_cache =
-        m_config_cache_alloc(tmp, global, &gl_next_conf);
-    struct gl_video_opts *opts = opts_cache->opts;
-    struct gl_next_opts *next_opts = next_opts_cache->opts;
-    bool border_alpha = (next_opts->border_background == BACKGROUND_COLOR &&
-                         opts->background_color.a != 255) ||
-                        next_opts->border_background == BACKGROUND_NONE;
-    ctx_opts->want_alpha = (opts->background == BACKGROUND_COLOR &&
-                            opts->background_color.a != 255) ||
-                           opts->background == BACKGROUND_NONE || border_alpha;
+    void *tmp = talloc_new(NULL);
+    bool res = want_alpha(mp_get_config_group(tmp, global, &gl_video_conf),
+                          mp_get_config_group(tmp, global, &gl_next_conf));
     talloc_free(tmp);
+    return res;
 }
 
-bool gpu_next_renderer_set_paused(struct gpu_next_renderer *p, bool paused)
+void mppl_video_reload_options(struct mppl_video *p)
 {
-    bool redraw = paused && p->is_interpolated;
-    p->paused = paused;
-    return redraw;
-}
-
-void gpu_next_renderer_reset(struct gpu_next_renderer *p)
-{
-    p->want_reset = true;
-}
-
-void gpu_next_renderer_update_options(struct gpu_next_renderer *p)
-{
+    // Special case for --image-lut which requires a full reset.
     int old_type = p->next_opts->image_lut.type;
     update_options(p);
     struct user_lut image_lut = p->next_opts->image_lut;
     p->want_reset |= image_lut.opt && ((!image_lut.path && image_lut.opt) ||
                      (image_lut.path && strcmp(image_lut.path, image_lut.opt)) ||
-                     old_type != image_lut.type);
+                     (old_type != image_lut.type));
 }
 
-void gpu_next_renderer_perfdata(struct gpu_next_renderer *p,
-                                struct voctrl_performance_data *perf)
+void mppl_video_configure_queue(struct mppl_video *p, struct vo *vo)
 {
-    copy_frame_info_to_mp(&p->perf_fresh, &perf->fresh, &p->hwdec.perf,
-                          &p->sw_upload_perf);
+    // pl_queue also retains past frames for the symmetric mixing window,
+    vo_set_queue_params(vo, 0, p->req_frames, 2 * p->req_frames - 1);
+}
+
+void mppl_video_set_paused(struct mppl_video *p, bool paused)
+{
+    p->paused = paused;
+}
+
+bool mppl_video_showing_interpolated_frame(struct mppl_video *p)
+{
+    return p->is_interpolated;
+}
+
+void mppl_video_reset(struct mppl_video *p, bool defer_until_new_id)
+{
+    p->want_seek_reset = defer_until_new_id;
+    if (!defer_until_new_id)
+        p->want_reset = true;
+}
+
+void mppl_video_perfdata(struct mppl_video *p, struct voctrl_performance_data *perf)
+{
+    copy_frame_info_to_mp(&p->perf_fresh, &perf->fresh, &p->hwdec.perf, &p->sw_upload_perf);
     copy_frame_info_to_mp(&p->perf_redraw, &perf->redraw, NULL, NULL);
 }
 
-void gpu_next_renderer_load_hwdec(struct gpu_next_renderer *p,
-                                  struct mp_hwdec_devices *devs, void *data)
+void mppl_video_load_hwdecs(struct mppl_video *p, struct mp_hwdec_devices *devs,
+                            struct hwdec_imgfmt_request *params)
 {
-    ra_hwdec_ctx_load_fmt(&p->hwdec_ctx, devs, data);
+    ra_hwdec_ctx_load_fmt(&p->hwdec_ctx, devs, params);
 }
 
 static char *cache_filepath(void *ta_ctx, char *dir, const char *prefix, uint64_t key)
@@ -2298,8 +2270,7 @@ done:
     talloc_free(ta_ctx);
 }
 
-static void cache_init(struct gpu_next_renderer *p, struct cache *cache,
-                       size_t max_size,
+static void cache_init(struct mppl_video *p, struct cache *cache, size_t max_size,
                        const char *dir_opt)
 {
     const char *name = cache == &p->shader_cache ? "shader" : "icc";
@@ -2341,7 +2312,7 @@ static int compare_atime(const void *a, const void *b)
     return (((struct file_entry *)b)->atime - ((struct file_entry *)a)->atime);
 }
 
-static void cache_uninit(struct gpu_next_renderer *p, struct cache *cache)
+static void cache_uninit(struct mppl_video *p, struct cache *cache)
 {
     if (!cache->cache)
         return;
@@ -2411,15 +2382,10 @@ done:
     pl_cache_destroy(&cache->cache);
 }
 
-void gpu_next_renderer_destroy(struct gpu_next_renderer **renderer)
+void mppl_video_uninit(struct mppl_video *p)
 {
-    struct gpu_next_renderer *p = *renderer;
-    if (!p)
-        return;
-
     // Drain any in-flight uploads.
-    if (p->gpu)
-        pl_gpu_finish(p->gpu);
+    pl_gpu_finish(p->gpu);
 
     pl_queue_destroy(&p->queue); // destroy this first
     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
@@ -2431,15 +2397,12 @@ void gpu_next_renderer_destroy(struct gpu_next_renderer **renderer)
 
     timer_pool_destroy(p->sw_upload_timer);
 
-    if (p->hwdec_initialized) {
-        slot_uninit(p, &p->hwdec);
-        slot_uninit(p, &p->el_hwdec);
-        ra_hwdec_ctx_uninit(&p->hwdec_ctx);
-    }
+    slot_uninit(p, &p->hwdec);
+    slot_uninit(p, &p->el_hwdec);
+    ra_hwdec_ctx_uninit(&p->hwdec_ctx);
 
     mp_assert(p->num_dr_buffers == 0);
-    if (p->dr_lock_initialized)
-        mp_mutex_destroy(&p->dr_lock);
+    mp_mutex_destroy(&p->dr_lock);
 
     cache_uninit(p, &p->shader_cache);
     cache_uninit(p, &p->icc_cache);
@@ -2457,46 +2420,26 @@ void gpu_next_renderer_destroy(struct gpu_next_renderer **renderer)
     }
 
     pl_options_free(&p->pars);
-
-    p->context = NULL;
-    p->ra_ctx = NULL;
-    p->pllog = NULL;
-    p->gpu = NULL;
     talloc_free(p);
-    *renderer = NULL;
 }
 
-struct gpu_next_renderer *gpu_next_renderer_create(
-    void *parent, struct mpv_global *global, struct mp_log *log,
-    struct gpu_ctx *context, struct mp_hwdec_devices *hwdec_devs,
-    bool load_all_hwdecs)
+struct mppl_video *mppl_video_init(struct mp_log *log, struct mpv_global *global,
+                                   struct gpu_ctx *ctx)
 {
-    struct gpu_next_renderer *p = talloc_zero(parent, struct gpu_next_renderer);
+    struct mppl_video *p = talloc_zero(NULL, struct mppl_video);
     p->opts_cache = m_config_cache_alloc(p, global, &gl_video_conf);
     p->next_opts_cache = m_config_cache_alloc(p, global, &gl_next_conf);
     p->next_opts = p->next_opts_cache->opts;
     p->video_eq = mp_csp_equalizer_create(p, global);
     p->global = global;
     p->log = log;
-    p->stats = stats_ctx_create(p, global, "gpu-next");
-    p->context = context;
-    p->ra_ctx = context->ra_ctx;
+    p->stats = stats_ctx_create(p, global, "vo/gpu-next");
+    p->ra_ctx = ctx->ra_ctx;
+    p->pllog = ctx->pllog;
+    p->gpu = ctx->gpu;
+    mp_mutex_init(&p->dr_lock);
 
     struct gl_video_opts *gl_opts = p->opts_cache->opts;
-    p->pllog = context->pllog;
-    p->gpu = context->gpu;
-    p->hwdec_ctx = (struct ra_hwdec_ctx) {
-        .log = p->log,
-        .global = p->global,
-        .ra_ctx = p->ra_ctx,
-    };
-
-    ra_hwdec_ctx_init(&p->hwdec_ctx, hwdec_devs, gl_opts->hwdec_interop,
-                      load_all_hwdecs);
-    p->hwdec_initialized = true;
-    mp_mutex_init(&p->dr_lock);
-    p->dr_lock_initialized = true;
-
     if (gl_opts->shader_cache)
         cache_init(p, &p->shader_cache, 10 << 20, gl_opts->shader_cache_dir);
     if (gl_opts->icc_opts->cache)
@@ -2514,7 +2457,26 @@ struct gpu_next_renderer *gpu_next_renderer_create(
     return p;
 }
 
-static const struct pl_filter_config *map_scaler(struct gpu_next_renderer *p,
+void mppl_video_init_hwdecs(struct mppl_video *p, struct mp_hwdec_devices *devs,
+                            bool load_all_by_default)
+{
+    struct gl_video_opts *gl_opts = p->opts_cache->opts;
+    p->hwdec_ctx = (struct ra_hwdec_ctx) {
+        .log = p->log,
+        .global = p->global,
+        .ra_ctx = p->ra_ctx,
+    };
+    ra_hwdec_ctx_init(&p->hwdec_ctx, devs, gl_opts->hwdec_interop, load_all_by_default);
+}
+
+void mppl_video_set_osd_source(struct mppl_video *p, struct osd_state *osd)
+{
+    if (p->osd != osd)
+        p->osd_sync++;
+    p->osd = osd;
+}
+
+static const struct pl_filter_config *map_scaler(struct mppl_video *p,
                                                  enum scaler_unit unit)
 {
     const struct pl_filter_preset fixed_scalers[] = {
@@ -2603,7 +2565,7 @@ static const struct pl_filter_config *map_scaler(struct gpu_next_renderer *p,
     return &par->config;
 }
 
-static const struct pl_hook *load_hook(struct gpu_next_renderer *p, const char *path)
+static const struct pl_hook *load_hook(struct mppl_video *p, const char *path)
 {
     if (!path || !path[0])
         return NULL;
@@ -2629,10 +2591,15 @@ static const struct pl_hook *load_hook(struct gpu_next_renderer *p, const char *
     return hook;
 }
 
-static void update_icc_opts(struct gpu_next_renderer *p, const struct mp_icc_opts *opts)
+static void update_icc_opts(struct mppl_video *p, const struct mp_icc_opts *opts)
 {
     if (!opts)
         return;
+
+    if (!opts->profile_auto && !p->icc_path) {
+        // Un-set any auto-loaded profiles if icc-profile-auto was disabled
+        mppl_video_set_icc_profile(p, (bstr) {0});
+    }
 
     int s_r = 0, s_g = 0, s_b = 0;
     gl_parse_3dlut_size(opts->size_str, &s_r, &s_g, &s_b);
@@ -2644,10 +2611,8 @@ static void update_icc_opts(struct gpu_next_renderer *p, const struct mp_icc_opt
     p->icc_params.cache = p->icc_cache.cache;
 
     if (!opts->profile || !opts->profile[0]) {
-        // Keep profiles supplied by the window system in auto mode, but
-        // discard a removed file profile or any profile when auto is disabled.
-        if (p->icc_path || !opts->profile_auto)
-            gpu_next_renderer_set_icc_profile(p, (bstr) {0});
+        // No profile enabled, un-load any existing profiles
+        mppl_video_set_icc_profile(p, (bstr) {0});
         TA_FREEP(&p->icc_path);
         return;
     }
@@ -2659,13 +2624,13 @@ static void update_icc_opts(struct gpu_next_renderer *p, const struct mp_icc_opt
     MP_VERBOSE(p, "Opening ICC profile '%s'\n", fname);
     struct bstr icc = stream_read_file(fname, p, p->global, 100000000); // 100 MB
     talloc_free(fname);
-    gpu_next_renderer_set_icc_profile(p, icc);
+    mppl_video_set_icc_profile(p, icc);
 
     // Update cached path
     talloc_replace(p, p->icc_path, opts->profile);
 }
 
-static void update_lut(struct gpu_next_renderer *p, struct user_lut *lut)
+static void update_lut(struct mppl_video *p, struct user_lut *lut)
 {
     if (!lut->opt || !lut->opt[0]) {
         pl_lut_free(&lut->lut);
@@ -2695,7 +2660,7 @@ static void update_lut(struct gpu_next_renderer *p, struct user_lut *lut)
     talloc_free(lutdata.start);
 }
 
-static void update_hook_opts_dynamic(struct gpu_next_renderer *p, const struct pl_hook *hook,
+static void update_hook_opts_dynamic(struct mppl_video *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi)
 {
     for (int i = 0; i < hook->num_parameters; i++) {
@@ -2712,7 +2677,7 @@ static void update_hook_opts_dynamic(struct gpu_next_renderer *p, const struct p
     }
 }
 
-static void update_hook_opts(struct gpu_next_renderer *p, char **opts, const char *shaderpath,
+static void update_hook_opts(struct mppl_video *p, char **opts, const char *shaderpath,
                              const struct pl_hook *hook)
 {
     for (int i = 0; i < hook->num_parameters; i++) {
@@ -2782,7 +2747,7 @@ static void update_hook_opts(struct gpu_next_renderer *p, char **opts, const cha
     }
 }
 
-static void update_render_options(struct gpu_next_renderer *p)
+static void update_render_options(struct mppl_video *p)
 {
     pl_options pars = p->pars;
     const struct gl_video_opts *opts = p->opts_cache->opts;
@@ -2828,7 +2793,6 @@ static void update_render_options(struct gpu_next_renderer *p)
                       (pars->params.skip_anti_aliasing ? 1 : 2);
     }
     req_frames = MPMIN(VO_MAX_REQ_FRAMES, req_frames);
-    // pl_queue also retains past frames for the symmetric mixing window,
     p->req_frames = req_frames;
 
     pars->params.deband_params = opts->deband ? &pars->deband_params : NULL;
@@ -2877,16 +2841,15 @@ static void update_render_options(struct gpu_next_renderer *p)
     };
 
     pars->color_map_params.tone_mapping_function = tone_map_funs[opts->tone_map.curve];
-AV_NOWARN_DEPRECATED(
-    pars->color_map_params.tone_mapping_param = opts->tone_map.curve_param;
-    if (isnan(pars->color_map_params.tone_mapping_param)) // vo_gpu compatibility
-        pars->color_map_params.tone_mapping_param = 0.0;
-)
+    pars->color_map_params.tone_constants = p->next_opts->tone_constants;
+
     pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
     pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
     pars->color_map_params.visualize_lut = opts->tone_map.visualize;
     pars->color_map_params.contrast_smoothness = opts->tone_map.contrast_smoothness;
     pars->color_map_params.gamut_mapping = gamut_modes[opts->tone_map.gamut_mode];
+    pars->color_map_params.mastering_clip = opts->tone_map.mastering_clip;
+    pars->color_map_params.film_strength = opts->tone_map.film_strength;
 
     pars->params.dither_params = NULL;
     pars->params.error_diffusion = NULL;
@@ -2930,4 +2893,11 @@ AV_NOWARN_DEPRECATED(
 
     MP_DBG(p, "Render options updated, flushing renderer cache.\n");
     p->flush_cache = p->paused || !p->next_opts->inter_preserve;
+
+    // These options are baked into mapped frames. Reset the queue to map the
+    // queued frames again.
+    p->want_reset = p->want_reset || p->last_ref_white != opts->hdr_reference_white;
+    p->want_reset = p->want_reset || ((p->last_srgb_power22 ^ opts->treat_srgb_as_power22) & 1);
+    p->last_ref_white = opts->hdr_reference_white;
+    p->last_srgb_power22 = opts->treat_srgb_as_power22;
 }

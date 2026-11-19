@@ -112,7 +112,7 @@ int libmpv_vk_create(struct render_backend *ctx, mpv_render_param *params,
 
     struct libmpv_vk *p = *out = talloc_zero(ctx->priv, struct libmpv_vk);
     p->ra_ctx = (struct ra_ctx) {.global = ctx->global, .log = ctx->log};
-    gpu_next_update_ra_ctx_opts(p, ctx->global, &p->ra_ctx.opts);
+    p->ra_ctx.opts.want_alpha = mppl_video_opts_want_alpha(ctx->global);
     p->context = (struct gpu_ctx) {
         .log = ctx->log,
         .ra_ctx = &p->ra_ctx,

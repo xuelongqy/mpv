@@ -275,7 +275,10 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
     }
     bool selector_present = false;
     char *selector = NULL;
-    for (int n = 0; params && params[n].type; n++) {
+    const char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
+    bool d3d11 = api && !strcmp(api, MPV_RENDER_API_TYPE_D3D11);
+    // D3D11 uses parameter 21 for its device initialization structure.
+    for (int n = 0; !d3d11 && params && params[n].type; n++) {
         if (params[n].type == MPV_RENDER_PARAM_RENDERER) {
             selector_present = true;
             selector = params[n].data;
@@ -300,8 +303,11 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
         }
     }
 
+    if (d3d11 && !selected)
+        selected = &render_backend_gpu;
+
     int err = MPV_ERROR_NOT_IMPLEMENTED;
-    if (ctx->auto_output && !selector_present) {
+    if (ctx->auto_output && !selected) {
         const struct render_backend_fns *preferred[] = {
             &render_backend_gpu_next, &render_backend_gpu, &render_backend_sw,
         };
@@ -311,7 +317,7 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
                 break;
         }
     }
-    for (int n = 0; render_backends[n] && (!ctx->auto_output || selector_present); n++) {
+    for (int n = 0; render_backends[n] && (!ctx->auto_output || selected); n++) {
 #if HAVE_APPLE_NATIVE
         if (mode && !strcmp(mode, "render") && render_backends[n] == &render_backend_apple)
             continue;

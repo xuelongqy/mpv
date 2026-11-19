@@ -49,6 +49,7 @@ extern "C" {
  * Supported backends
  * ------------------
  *
+ * Direct3D 11: via MPV_RENDER_API_TYPE_D3D11, see render_d3d11.h header.
  * OpenGL: via MPV_RENDER_API_TYPE_OPENGL, see render_gl.h header.
  * Software: via MPV_RENDER_API_TYPE_SW, see section "Software renderer"
  *
@@ -213,8 +214,9 @@ typedef enum mpv_render_param_type {
      * Control surface depth. Valid for mpv_render_context_render().
      * Type: int*
      * This implies the depth of the surface passed to the render function in
-     * bits per channel. If omitted or set to 0, the renderer will assume 8.
-     * Typically used to control dithering.
+     * bits per channel. If omitted or set to 0, the renderer will use the
+     * depth of the texture format with the Direct3D 11 backend, and assume 8
+     * otherwise. Typically used to control dithering.
      */
     MPV_RENDER_PARAM_DEPTH = 5,
     /**
@@ -426,6 +428,9 @@ typedef enum mpv_render_param_type {
      * Select the video renderer. Valid only for mpv_render_context_create().
      * Type: char*
      *
+     * Unavailable with API_TYPE "d3d11", where this number is used for
+     * MPV_RENDER_PARAM_D3D11_INIT_PARAMS and the legacy GPU renderer is used.
+     *
      * Supported values:
      *  "gpu"
      *      Select the legacy GPU renderer.
@@ -486,6 +491,19 @@ typedef enum mpv_render_param_type {
     MPV_RENDER_PARAM_APPLE_NATIVE_INIT_PARAMS = 26,
     /** Experimental Apple native target. See render_apple.h. */
     MPV_RENDER_PARAM_APPLE_NATIVE_TARGET = 27,
+    /**
+     * Required parameters for initializing the Direct3D 11 renderer. Valid
+     * for mpv_render_context_create() with API_TYPE "d3d11".
+     * Type: mpv_d3d11_init_params*
+     */
+    MPV_RENDER_PARAM_D3D11_INIT_PARAMS = 21,
+    /**
+     * Describes a D3D11 render target. Valid for mpv_render_context_render().
+     * The context must use API_TYPE "d3d11". This number is also used for
+     * MPV_RENDER_PARAM_VULKAN_INIT_PARAMS at Vulkan context creation.
+     * Type: mpv_d3d11_fbo*
+     */
+    MPV_RENDER_PARAM_D3D11_FBO = 22,
 } mpv_render_param_type;
 
 /**
@@ -528,6 +546,8 @@ typedef struct mpv_render_param {
 /**
  * Predefined values for MPV_RENDER_PARAM_API_TYPE.
  */
+// See render_d3d11.h
+#define MPV_RENDER_API_TYPE_D3D11 "d3d11"
 // See render_gl.h
 #define MPV_RENDER_API_TYPE_OPENGL "opengl"
 // See section "Software renderer"

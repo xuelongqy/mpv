@@ -16,7 +16,7 @@
 struct priv {
     struct libmpv_gpu_context *context;
     struct gpu_ctx *gpu;
-    struct gpu_next_renderer *renderer;
+    struct mppl_video *renderer;
 #if HAVE_VULKAN
     struct libmpv_vk *vk;
 #endif
@@ -31,6 +31,9 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     if (!api)
         return MPV_ERROR_INVALID_PARAMETER;
     bool vulkan = !strcmp(api, MPV_RENDER_API_TYPE_VULKAN);
+    if (!vulkan && strcmp(api, MPV_RENDER_API_TYPE_OPENGL))
+        return MPV_ERROR_NOT_IMPLEMENTED;
+
     if (vulkan) {
 #if HAVE_VULKAN
         int err = libmpv_vk_create(ctx, params, &p->vk, &p->gpu);
@@ -48,19 +51,17 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
         return MPV_ERROR_NOT_IMPLEMENTED;
 #endif
 
-        p->gpu = gpu_ctx_create_from_ra(p->context->ra_ctx, false);
+        p->gpu = gpu_ctx_create(ctx->log, p->context->ra_ctx, false);
         if (!p->gpu)
             return MPV_ERROR_UNSUPPORTED;
     }
 
     ctx->hwdec_devs = hwdec_devices_create();
-    p->renderer = gpu_next_renderer_create(p, ctx->global, ctx->log,
-                                           p->gpu, ctx->hwdec_devs, !vulkan);
-    if (!p->renderer)
-        return MPV_ERROR_UNSUPPORTED;
+    p->renderer = mppl_video_init(ctx->log, ctx->global, p->gpu);
+    mppl_video_init_hwdecs(p->renderer, ctx->hwdec_devs, !vulkan);
 
     p->gpu->ra_ctx->opts.want_alpha =
-        gpu_next_renderer_want_alpha(p->renderer);
+        mppl_video_want_alpha(p->renderer);
     ctx->driver_caps = VO_CAP_ROTATE90 | VO_CAP_FILM_GRAIN | VO_CAP_VFLIP;
     return 0;
 }
@@ -68,7 +69,7 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
 static bool check_format(struct render_backend *ctx, int imgfmt)
 {
     struct priv *p = ctx->priv;
-    return gpu_next_renderer_check_format(p->renderer, imgfmt);
+    return mppl_video_check_format(p->renderer, imgfmt);
 }
 
 static int set_parameter(struct render_backend *ctx, mpv_render_param param)
@@ -82,47 +83,45 @@ static int set_parameter(struct render_backend *ctx, mpv_render_param param)
         return MPV_ERROR_NOT_IMPLEMENTED;
     if (!param.data)
         return MPV_ERROR_INVALID_PARAMETER;
-    if (!gpu_next_renderer_use_auto_icc(p->renderer))
+    if (!mppl_video_icc_auto_enabled(p->renderer))
         return 0;
 
     mpv_byte_array *data = param.data;
     bstr icc = bstrdup(NULL, (bstr){data->data, data->size});
-    return gpu_next_renderer_set_icc_profile(p->renderer, icc)
+    return mppl_video_set_icc_profile(p->renderer, icc)
            ? 0 : MPV_ERROR_GENERIC;
 }
 
 static void reconfig(struct render_backend *ctx, struct mp_image_params *params)
 {
     struct priv *p = ctx->priv;
-    gpu_next_renderer_config(p->renderer, params);
+    mppl_video_config(p->renderer, params);
 }
 
 static void reset(struct render_backend *ctx)
 {
     struct priv *p = ctx->priv;
-    gpu_next_renderer_reset(p->renderer);
+    // The render context can outlive the VO that assigns frame IDs.
+    mppl_video_reset(p->renderer, false);
 }
 
 static void update_external(struct render_backend *ctx, struct vo *vo)
 {
     struct priv *p = ctx->priv;
-    gpu_next_renderer_set_osd(p->renderer, vo ? vo->osd : NULL);
+    mppl_video_set_osd_source(p->renderer, vo ? vo->osd : NULL);
     if (!vo)
         return;
 
-    gpu_next_renderer_update_options(p->renderer);
-    p->gpu->ra_ctx->opts.want_alpha =
-        gpu_next_renderer_want_alpha(p->renderer);
-    int req_frames, max_frames;
-    gpu_next_renderer_get_queue_params(p->renderer, &req_frames, &max_frames);
-    vo_set_queue_params(vo, 0, req_frames, max_frames);
+    mppl_video_reload_options(p->renderer);
+    p->gpu->ra_ctx->opts.want_alpha = mppl_video_want_alpha(p->renderer);
+    mppl_video_configure_queue(p->renderer, vo);
 }
 
 static void resize(struct render_backend *ctx, struct mp_rect *src,
                    struct mp_rect *dst, struct mp_osd_res *osd)
 {
     struct priv *p = ctx->priv;
-    gpu_next_renderer_resize(p->renderer, *src, *dst, *osd);
+    mppl_video_resize(p->renderer, *src, *dst, *osd);
 }
 
 static int get_target_size(struct render_backend *ctx, mpv_render_param *params,
@@ -146,26 +145,21 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
                   struct vo_frame *frame)
 {
     struct priv *p = ctx->priv;
-    struct gpu_next_target target;
-    struct mp_image_params hint;
-    gpu_next_renderer_prepare(p->renderer, frame, pl_color_space_monitor, 0,
-                              false, &target, &hint);
-    target.dither_depth = GET_MPV_RENDER_PARAM(
-        params, MPV_RENDER_PARAM_DEPTH, int, 8);
-    if (target.dither_depth <= 0)
-        target.dither_depth = 8;
+    mppl_video_begin_frame(p->renderer, frame, pl_color_space_monitor, 0);
+    int depth = GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_DEPTH, int, 8);
+    if (depth <= 0)
+        depth = 8;
 
 #if HAVE_VULKAN
     if (p->vk) {
         struct pl_frame target_frame;
         int err = libmpv_vk_start_frame(p->vk, params, &target_frame);
         if (err < 0) {
-            gpu_next_renderer_skip_frame(p->renderer, frame);
+            mppl_video_skip_frame(p->renderer, frame);
             return err;
         }
-        struct gpu_next_render_result result;
-        bool ok = gpu_next_renderer_render(p->renderer, frame, &target_frame,
-                                           &target, &result);
+        bool ok = mppl_video_render_frame(p->renderer, frame, &target_frame,
+                                          depth, NULL, NULL);
         err = libmpv_vk_end_frame(p->vk, params);
         return err < 0 ? err : ok ? 0 : MPV_ERROR_GENERIC;
     }
@@ -174,21 +168,21 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     mpv_opengl_fbo *fbo = get_mpv_render_param(
         params, MPV_RENDER_PARAM_OPENGL_FBO, NULL);
     if (!fbo) {
-        gpu_next_renderer_skip_frame(p->renderer, frame);
+        mppl_video_skip_frame(p->renderer, frame);
         return MPV_ERROR_INVALID_PARAMETER;
     }
 
     struct ra_tex *ra_target;
     int err = p->context->fns->wrap_fbo(p->context, params, &ra_target);
     if (err < 0) {
-        gpu_next_renderer_skip_frame(p->renderer, frame);
+        mppl_video_skip_frame(p->renderer, frame);
         return err;
     }
 
     pl_tex target_tex = gpu_ctx_wrap_opengl_fbo(p->gpu, fbo->fbo,
                                                 fbo->w, fbo->h);
     if (!target_tex) {
-        gpu_next_renderer_skip_frame(p->renderer, frame);
+        mppl_video_skip_frame(p->renderer, frame);
         p->context->fns->done_frame(p->context, frame->display_synced);
         return MPV_ERROR_GENERIC;
     }
@@ -212,9 +206,8 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     };
     target_frame.repr.alpha = alpha ? PL_ALPHA_INDEPENDENT : PL_ALPHA_NONE;
 
-    struct gpu_next_render_result result;
-    bool ok = gpu_next_renderer_render(p->renderer, frame, &target_frame, &target,
-                                       &result);
+    bool ok = mppl_video_render_frame(p->renderer, frame, &target_frame, depth,
+                                      NULL, NULL);
     pl_tex_destroy(p->gpu->gpu, &target_tex);
     p->context->fns->done_frame(p->context, frame->display_synced);
     return ok ? 0 : MPV_ERROR_GENERIC;
@@ -224,22 +217,21 @@ static struct mp_image *get_image(struct render_backend *ctx, int imgfmt,
                                   int w, int h, int stride_align, int flags)
 {
     struct priv *p = ctx->priv;
-    return gpu_next_renderer_get_image(p->renderer, imgfmt, w, h,
-                                       stride_align, flags);
+    return mppl_video_get_image(p->renderer, imgfmt, w, h, stride_align, flags);
 }
 
 static void screenshot(struct render_backend *ctx, struct vo_frame *frame,
                        struct voctrl_screenshot *args)
 {
     struct priv *p = ctx->priv;
-    gpu_next_renderer_screenshot(p->renderer, frame, args);
+    mppl_video_screenshot(p->renderer, frame, args);
 }
 
 static void perfdata(struct render_backend *ctx,
                      struct voctrl_performance_data *out)
 {
     struct priv *p = ctx->priv;
-    gpu_next_renderer_perfdata(p->renderer, out);
+    mppl_video_perfdata(p->renderer, out);
 }
 
 static void destroy(struct render_backend *ctx)
@@ -247,7 +239,8 @@ static void destroy(struct render_backend *ctx)
     struct priv *p = ctx->priv;
     if (!p)
         return;
-    gpu_next_renderer_destroy(&p->renderer);
+    if (p->renderer)
+        mppl_video_uninit(p->renderer);
     hwdec_devices_destroy(ctx->hwdec_devs);
     ctx->hwdec_devs = NULL;
 #if HAVE_VULKAN

@@ -39,12 +39,18 @@ API changes
           Existing clients remain compatible. New clients check major 2/minor >= 8
           and context creation; Vulkan support remains optional.
           Future extensions retain v1 without changing its layout or requirements.
+        - integrate the upstream D3D11 render API. Its parameters 21 (create)
+          and 22 (render) use the D3D11 types when the API type is "d3d11".
+          The numbers of the downstream renderer and Vulkan parameters are unchanged.
  2.7    - install the experimental Vulkan Render API header, render_vk.h
         - add Vulkan device, target and retirement parameters (draft version 1)
           Vulkan support remains optional; use matching headers and library.
           Client API version alone does not identify future draft revisions.
+ 2.6    - add MPV_RENDER_PARAM_RENDERER for the downstream render API
  --- mpv 0.42.0 ---
- 2.6    - add MPV_RENDER_PARAM_RENDERER
+ 2.6    - add MPV_RENDER_API_TYPE_D3D11 render API backend, along with
+          MPV_RENDER_PARAM_D3D11_INIT_PARAMS and MPV_RENDER_PARAM_D3D11_FBO,
+          and a new render_d3d11.h header.
  --- mpv 0.40.0 ---
  2.5    - Deprecate MPV_RENDER_PARAM_AMBIENT_LIGHT. no replacement.
  --- mpv 0.39.0 ---

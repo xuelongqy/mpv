@@ -1,96 +1,84 @@
+/*
+ * Copyright (C) 2021 Niklas Haas
+ *
+ * This file is part of mpv.
+ *
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * mpv is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 #pragma once
 
 #include <libplacebo/renderer.h>
 
+#include "common/common.h"
 #include "misc/bstr.h"
-#include "video/mp_image.h"
-#include "video/out/vo.h"
+#include "sub/osd.h"
 
-struct mp_hwdec_devices;
-struct mp_log;
-struct mp_osd_res;
-struct mp_rect;
-struct mpv_global;
 struct gpu_ctx;
-struct osd_state;
-struct ra_ctx_opts;
+struct hwdec_imgfmt_request;
+struct mp_hwdec_devices;
+struct mp_image;
+struct mp_image_params;
+struct mp_log;
+struct mpv_global;
+struct vo;
+struct vo_frame;
+struct voctrl_performance_data;
+struct voctrl_screenshot;
 
-struct gpu_next_renderer;
-
-enum gpu_next_hint_action {
-    GPU_NEXT_HINT_KEEP,
-    GPU_NEXT_HINT_CLEAR,
-    GPU_NEXT_HINT_SET,
+enum mppl_video_hint {
+    MPPL_VIDEO_HINT_NONE,  // hinting is disabled
+    MPPL_VIDEO_HINT_KEEP,  // there is no frame to derive a hint from
+    MPPL_VIDEO_HINT_SET,   // the hint is to be set
 };
 
-struct gpu_next_target {
-    struct pl_color_space color_space;
-    struct pl_color_space hint;
-    float reference_luminance;
-    int dither_depth;
-    bool unknown;
-    bool hint_enabled;
-    bool external_params;
-    enum gpu_next_hint_action hint_action;
-};
+struct mppl_video;
 
-struct gpu_next_render_result {
-    struct mp_image_params target_params;
-    struct pl_hdr_metadata hdr;
-    bool has_peak;
-    bool interpolated;
-};
-
-struct gpu_next_renderer *gpu_next_renderer_create(
-    void *parent, struct mpv_global *global, struct mp_log *log,
-    struct gpu_ctx *context, struct mp_hwdec_devices *hwdec_devs,
-    bool load_all_hwdecs);
-void gpu_next_renderer_destroy(struct gpu_next_renderer **renderer);
-void gpu_next_update_ra_ctx_opts(void *parent, struct mpv_global *global,
-                                 struct ra_ctx_opts *opts);
-
-bool gpu_next_renderer_check_format(struct gpu_next_renderer *renderer,
-                                    int imgfmt);
-struct mp_image *gpu_next_renderer_get_image(struct gpu_next_renderer *renderer,
-                                             int imgfmt, int w, int h,
-                                             int stride_align, int flags);
-void gpu_next_renderer_set_osd(struct gpu_next_renderer *renderer,
-                               struct osd_state *osd);
-void gpu_next_renderer_config(struct gpu_next_renderer *renderer,
-                              const struct mp_image_params *params);
-void gpu_next_renderer_resize(struct gpu_next_renderer *renderer,
-                              struct mp_rect src, struct mp_rect dst,
-                              struct mp_osd_res osd);
-void gpu_next_renderer_get_queue_params(struct gpu_next_renderer *renderer,
-                                        int *req_frames, int *max_frames);
-
-void gpu_next_renderer_prepare(struct gpu_next_renderer *renderer,
-                               struct vo_frame *frame,
-                               struct pl_color_space target_csp,
-                               float reference_luminance,
-                               bool target_hint_supported,
-                               struct gpu_next_target *target,
-                               struct mp_image_params *hint);
-void gpu_next_renderer_skip_frame(struct gpu_next_renderer *renderer,
-                                  struct vo_frame *frame);
-bool gpu_next_renderer_render(struct gpu_next_renderer *renderer,
-                              struct vo_frame *frame,
-                              struct pl_frame *target_frame,
-                              const struct gpu_next_target *target_state,
-                              struct gpu_next_render_result *result);
-
-bool gpu_next_renderer_set_icc_profile(struct gpu_next_renderer *renderer,
-                                       bstr icc);
-void gpu_next_renderer_reset(struct gpu_next_renderer *renderer);
-bool gpu_next_renderer_set_paused(struct gpu_next_renderer *renderer,
-                                  bool paused);
-void gpu_next_renderer_update_options(struct gpu_next_renderer *renderer);
-bool gpu_next_renderer_want_alpha(struct gpu_next_renderer *renderer);
-bool gpu_next_renderer_use_auto_icc(struct gpu_next_renderer *renderer);
-void gpu_next_renderer_screenshot(struct gpu_next_renderer *renderer,
-                                  struct vo_frame *frame,
-                                  struct voctrl_screenshot *args);
-void gpu_next_renderer_perfdata(struct gpu_next_renderer *renderer,
-                                struct voctrl_performance_data *out);
-void gpu_next_renderer_load_hwdec(struct gpu_next_renderer *renderer,
-                                  struct mp_hwdec_devices *devs, void *data);
+struct mppl_video *mppl_video_init(struct mp_log *log, struct mpv_global *global,
+                                   struct gpu_ctx *ctx);
+void mppl_video_uninit(struct mppl_video *p);
+void mppl_video_init_hwdecs(struct mppl_video *p, struct mp_hwdec_devices *devs,
+                            bool load_all_by_default);
+void mppl_video_load_hwdecs(struct mppl_video *p, struct mp_hwdec_devices *devs,
+                            struct hwdec_imgfmt_request *params);
+void mppl_video_set_osd_source(struct mppl_video *p, struct osd_state *osd);
+bool mppl_video_check_format(struct mppl_video *p, int format);
+struct mp_image *mppl_video_get_image(struct mppl_video *p, int imgfmt, int w, int h,
+                                      int stride_align, int flags);
+void mppl_video_config(struct mppl_video *p, struct mp_image_params *params);
+void mppl_video_resize(struct mppl_video *p, struct mp_rect src, struct mp_rect dst,
+                       struct mp_osd_res osd);
+void mppl_video_configure_queue(struct mppl_video *p, struct vo *vo);
+void mppl_video_reload_options(struct mppl_video *p);
+bool mppl_video_want_alpha(struct mppl_video *p);
+bool mppl_video_opts_want_alpha(struct mpv_global *global);
+bool mppl_video_icc_auto_enabled(struct mppl_video *p);
+bool mppl_video_set_icc_profile(struct mppl_video *p, struct bstr icc);
+void mppl_video_begin_frame(struct mppl_video *p, struct vo_frame *frame,
+                            struct pl_color_space display_csp, float display_ref_luma);
+enum mppl_video_hint mppl_video_get_target_hint(struct mppl_video *p, struct vo_frame *frame,
+                                                struct pl_color_space *out_hint);
+void mppl_video_skip_frame(struct mppl_video *p, struct vo_frame *frame);
+bool mppl_video_render_frame(struct mppl_video *p, struct vo_frame *frame,
+                             const struct pl_frame *target, int fb_depth,
+                             const struct pl_color_space *hint,
+                             struct mp_image_params *target_params);
+bool mppl_video_get_hdr_metadata(struct mppl_video *p, struct pl_hdr_metadata *out);
+enum pl_color_levels mppl_video_get_output_levels(struct mppl_video *p);
+void mppl_video_set_paused(struct mppl_video *p, bool paused);
+bool mppl_video_showing_interpolated_frame(struct mppl_video *p);
+void mppl_video_reset(struct mppl_video *p, bool defer_until_new_id);
+void mppl_video_perfdata(struct mppl_video *p, struct voctrl_performance_data *perf);
+void mppl_video_screenshot(struct mppl_video *p, struct vo_frame *frame,
+                           struct voctrl_screenshot *args);

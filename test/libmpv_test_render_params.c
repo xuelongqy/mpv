@@ -14,6 +14,12 @@
 
 #include <mpv/client.h>
 #include <mpv/render.h>
+#include <mpv/render_d3d11.h>
+
+#include "config.h"
+
+_Static_assert(MPV_RENDER_PARAM_D3D11_INIT_PARAMS == 21, "D3D11 init parameter ABI");
+_Static_assert(MPV_RENDER_PARAM_D3D11_FBO == 22, "D3D11 target parameter ABI");
 
 static void check_create(const char *api, const char *renderer, bool include_renderer,
                          int expected)
@@ -78,6 +84,19 @@ static void check_output_modes(void)
             }
             mpv_render_context_free(ctx);
         }
+    }
+    mpv_d3d11_init_params init = {0};
+    mpv_render_param params[] = {
+        {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_D3D11},
+        {MPV_RENDER_PARAM_D3D11_INIT_PARAMS, &init},
+        {0},
+    };
+    mpv_render_context *ctx = NULL;
+    int expected = HAVE_D3D11 ? MPV_ERROR_INVALID_PARAMETER : MPV_ERROR_NOT_IMPLEMENTED;
+    int err = mpv_render_context_create(&ctx, mpv, params);
+    if (err != expected || ctx) {
+        fprintf(stderr, "D3D11 initialization: expected %d, got %d\n", expected, err);
+        exit(1);
     }
     mpv_terminate_destroy(mpv);
 }

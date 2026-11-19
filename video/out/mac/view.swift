@@ -29,7 +29,7 @@ class View: NSView, CALayerDelegate {
     override var acceptsFirstResponder: Bool { return true }
 
     override var isOpaque: Bool {
-        if let metalLayer = layer as? MetalLayer {
+        if let metalLayer = layer as? CAMetalLayer {
             return !metalLayer.isOpaque
         }
 
@@ -92,7 +92,7 @@ class View: NSView, CALayerDelegate {
             }
         }
         if files.isEmpty { return false }
-        input?.open(files: files)
+        input?.handleDnd(files: files)
         return true
     }
 
