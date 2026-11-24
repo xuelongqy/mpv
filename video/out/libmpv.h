@@ -22,6 +22,21 @@ void mp_render_context_set_control_callback(mpv_render_context *ctx,
                                             void *callback_ctx);
 bool mp_render_context_acquire(mpv_render_context *ctx);
 
+enum native_video {
+    NATIVE_VIDEO_GENERIC,
+    NATIVE_VIDEO_HDR10,
+    NATIVE_VIDEO_DV,
+    NATIVE_VIDEO_UNSUPPORTED,
+};
+
+enum native_policy {
+    NATIVE_EXPLICIT,
+    NATIVE_AUTO_WITH_FALLBACK,
+    NATIVE_AUTO_WITHOUT_FALLBACK,
+};
+
+struct mp_codec_params;
+
 struct render_backend {
     struct mpv_global *global;
     struct mp_log *log;
@@ -31,6 +46,7 @@ struct render_backend {
     int driver_caps;
     struct mp_hwdec_devices *hwdec_devs;
 
+    enum native_video native_video; // Snapshot for this render call.
     void *priv;
 };
 
@@ -44,6 +60,10 @@ struct render_backend_fns {
     // if the API is not included in this backend.
     // If this fails, ->destroy() will be called.
     int (*init)(struct render_backend *ctx, mpv_render_param *params);
+    // Optional stream selection for native backends. Display HDR10 capability
+    // is -1 if unspecified, 0 if unsupported, or 1 if supported.
+    enum native_video (*select_native)(struct render_backend *ctx,
+        const struct mp_codec_params *codec, enum native_policy policy, int display_hdr10);
     // Check if the passed IMGFMT_ is supported.
     bool (*check_format)(struct render_backend *ctx, int imgfmt);
     // Implementation of mpv_render_context_set_parameter(). Optional.
@@ -75,8 +95,9 @@ struct render_backend_fns {
     // Implementation of mpv_render_context_render().
     int (*render)(struct render_backend *ctx, mpv_render_param *params,
                   struct vo_frame *frame);
-    // Optional native presentation, after waiting for the frame's target time.
-    int (*present)(struct render_backend *ctx);
+    // Optional native presentation after the target time. Discard the sample
+    // and its output when the stream changed during render().
+    int (*present)(struct render_backend *ctx, mpv_render_param *params, bool display);
     // Free all data in ctx->priv.
     void (*destroy)(struct render_backend *ctx);
 };
@@ -85,7 +106,10 @@ extern const struct render_backend_fns render_backend_gpu;
 extern const struct render_backend_fns render_backend_gpu_next;
 extern const struct render_backend_fns render_backend_sw;
 extern const struct render_backend_fns render_backend_apple;
-struct mp_codec_params;
-bool mpv_apple_native_supported(struct render_backend *ctx,
-                                const struct mp_codec_params *codec);
-bool mp_render_context_can_fallback(mpv_render_context *ctx, uint64_t serial);
+extern const struct render_backend_fns render_backend_android;
+bool mp_native_hdr10_codec(const struct mp_codec_params *codec);
+struct AVCodecParameters;
+struct AVPacket;
+bool mp_native_hdr10_packet(const struct AVCodecParameters *params, const struct AVPacket *pkt);
+bool mp_render_context_get_recovery(mpv_render_context *ctx, uint64_t serial,
+                                    bool *try_render);

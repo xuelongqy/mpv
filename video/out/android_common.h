@@ -22,8 +22,15 @@
 #include "common/common.h"
 
 struct vo;
+struct mp_draw_sub_cache;
+struct mp_log;
+struct osd_state;
+struct mp_osd_res;
 
 bool vo_android_init(struct vo *vo);
 void vo_android_uninit(struct vo *vo);
 ANativeWindow *vo_android_native_window(struct vo *vo);
 bool vo_android_surface_size(struct vo *vo, int *w, int *h);
+bool android_draw_osd(struct mp_log *log, ANativeWindow *window,
+                      struct mp_draw_sub_cache *cache, struct osd_state *osd,
+                      const struct mp_osd_res *res, double pts, int64_t *prev_id);

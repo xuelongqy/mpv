@@ -1,5 +1,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
+#import <TargetConditionals.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 #include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
@@ -71,26 +73,70 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     return 0;
 }
 
-bool mpv_apple_native_supported(struct render_backend *ctx,
-                                const struct mp_codec_params *codec)
+static bool dolby_vision_supported(struct priv *p, const AVPacketSideData *sd)
 {
-    struct priv *p = ctx->priv;
-    if (!codec || !codec->lav_codecpar || codec->rotate)
-        return false;
-    const AVCodecParameters *params = codec->lav_codecpar;
-    if (params->codec_id != AV_CODEC_ID_H264 && params->codec_id != AV_CODEC_ID_HEVC)
-        return false;
-    const AVPacketSideData *sd = av_packet_side_data_get(params->coded_side_data,
-        params->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF);
-    if (!codec->dovi && !sd)
-        return true;
-    if (!p->native_dv || !AVPlayer.eligibleForHDRPlayback || !sd ||
+    if (!p->native_dv || !AVPlayer.eligibleForHDRPlayback || !sd || !sd->data ||
         sd->size < sizeof(AVDOVIDecoderConfigurationRecord))
         return false;
     const AVDOVIDecoderConfigurationRecord *dv = (const void *)sd->data;
-    return dv->dv_version_major == 1 && dv->dv_profile == 5 && dv->dv_level <= 63 &&
-           dv->rpu_present_flag && dv->bl_present_flag && !dv->el_present_flag &&
-           !dv->dv_bl_signal_compatibility_id && dv->dv_md_compression == AV_DOVI_COMPRESSION_NONE;
+    if (dv->dv_version_major != 1 || dv->dv_level > 63 ||
+        !dv->rpu_present_flag || !dv->bl_present_flag || dv->el_present_flag ||
+        dv->dv_md_compression != AV_DOVI_COMPRESSION_NONE)
+        return false;
+
+    if (dv->dv_profile == 5)
+        return dv->dv_bl_signal_compatibility_id == 0;
+    if (dv->dv_profile == 8 && dv->dv_bl_signal_compatibility_id == 1) {
+        // Apple's documented Profile 8.1 playback starts with the 27 releases.
+        if (__builtin_available(macOS 27.0, iOS 27.0, *))
+            return true;
+    }
+    return false;
+}
+
+static enum native_video select_native(struct render_backend *ctx,
+    const struct mp_codec_params *codec, enum native_policy policy, int display_hdr10)
+{
+    if (!codec)
+        return policy == NATIVE_EXPLICIT ? NATIVE_VIDEO_GENERIC : NATIVE_VIDEO_UNSUPPORTED;
+    struct priv *p = ctx->priv;
+    if (codec->rotate)
+        return NATIVE_VIDEO_UNSUPPORTED;
+    const AVCodecParameters *params = codec->lav_codecpar;
+    enum AVCodecID codec_id = params ? params->codec_id : AV_CODEC_ID_NONE;
+    CMVideoCodecType codec_type = 0;
+    switch (codec_id) {
+    case AV_CODEC_ID_H264: codec_type = kCMVideoCodecType_H264; break;
+    case AV_CODEC_ID_HEVC: codec_type = kCMVideoCodecType_HEVC; break;
+    default:
+        // Explicit native output can negotiate other codecs with FFmpeg and VideoToolbox.
+        if (policy != NATIVE_EXPLICIT)
+            return NATIVE_VIDEO_UNSUPPORTED;
+        break;
+    }
+    if (codec_type && !VTIsHardwareDecodeSupported(codec_type))
+        return NATIVE_VIDEO_UNSUPPORTED;
+
+    const AVPacketSideData *sd = params ? av_packet_side_data_get(params->coded_side_data,
+        params->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF) : NULL;
+    if (codec->dovi || sd) {
+        if (codec_id != AV_CODEC_ID_HEVC || !dolby_vision_supported(p, sd))
+            return NATIVE_VIDEO_UNSUPPORTED;
+        return NATIVE_VIDEO_DV;
+    }
+    if (mp_native_hdr10_codec(codec)) {
+#if TARGET_OS_IOS && !TARGET_OS_MACCATALYST && !TARGET_OS_SIMULATOR
+        if (display_hdr10 < 0)
+            display_hdr10 = 1;
+#endif
+        if (!display_hdr10)
+            return NATIVE_VIDEO_UNSUPPORTED;
+        if (display_hdr10 == 1)
+            return AVPlayer.eligibleForHDRPlayback ? NATIVE_VIDEO_HDR10
+                                                   : NATIVE_VIDEO_UNSUPPORTED;
+    }
+    return policy == NATIVE_AUTO_WITH_FALLBACK ? NATIVE_VIDEO_UNSUPPORTED
+                                                    : NATIVE_VIDEO_GENERIC;
 }
 
 static bool check_format(struct render_backend *ctx, int imgfmt)
@@ -197,6 +243,16 @@ static int update_overlay(struct render_backend *ctx, double pts)
     return 0;
 }
 
+static bool has_attachment(CVPixelBufferRef buffer, CFStringRef key,
+                           CFTypeRef expected)
+{
+    CFTypeRef value = CVBufferCopyAttachment(buffer, key, NULL);
+    bool match = value && CFEqual(value, expected);
+    if (value)
+        CFRelease(value);
+    return match;
+}
+
 static int render(struct render_backend *ctx, mpv_render_param *params,
                   struct vo_frame *frame)
 {
@@ -220,9 +276,31 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         bool has_rpu = rpu && CFGetTypeID(rpu) == CFDataGetTypeID() && CFDataGetLength(rpu);
         if (rpu)
             CFRelease(rpu);
-        if (image->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION && !has_rpu) {
-            MP_ERR(ctx, "Native DV metadata is unavailable; refusing an unprocessed frame.\n");
+        enum native_video video = ctx->native_video;
+        bool hdr = image->params.color.transfer == PL_COLOR_TRC_PQ ||
+                   image->params.color.transfer == PL_COLOR_TRC_HLG;
+        if ((hdr || video != NATIVE_VIDEO_GENERIC) && !AVPlayer.eligibleForHDRPlayback) {
+            MP_ERR(ctx, "Apple native HDR presentation is unavailable.\n");
             return MPV_ERROR_UNSUPPORTED;
+        }
+        if (has_rpu != (video == NATIVE_VIDEO_DV) ||
+            (image->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION && !has_rpu)) {
+            MP_ERR(ctx, "Native Dolby Vision frame does not match the selected video format.\n");
+            return MPV_ERROR_UNSUPPORTED;
+        }
+        if (video == NATIVE_VIDEO_HDR10) {
+            OSType format = CVPixelBufferGetPixelFormatType(buffer);
+            if ((format != kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange &&
+                 format != kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) ||
+                !has_attachment(buffer, kCVImageBufferColorPrimariesKey,
+                                kCVImageBufferColorPrimaries_ITU_R_2020) ||
+                !has_attachment(buffer, kCVImageBufferTransferFunctionKey,
+                                kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) ||
+                !has_attachment(buffer, kCVImageBufferYCbCrMatrixKey,
+                                kCVImageBufferYCbCrMatrix_ITU_R_2020)) {
+                MP_ERR(ctx, "VideoToolbox did not produce a 10-bit BT.2020 PQ frame.\n");
+                return MPV_ERROR_UNSUPPORTED;
+            }
         }
         CMVideoFormatDescriptionRef format = NULL;
         OSStatus status = CMVideoFormatDescriptionCreateForImageBuffer(NULL, buffer, &format);
@@ -237,6 +315,8 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         if (status)
             return MPV_ERROR_UNSUPPORTED;
         CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(p->pending, true);
+        if (!attachments || !CFArrayGetCount(attachments))
+            return MPV_ERROR_UNSUPPORTED;
         CFMutableDictionaryRef first = (void *)CFArrayGetValueAtIndex(attachments, 0);
         // mpv waits for presentation; the layer must not run a second media clock.
         CFDictionarySetValue(first, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
@@ -252,9 +332,22 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     return err;
 }
 
-static int present(struct render_backend *ctx)
+static int present(struct render_backend *ctx, mpv_render_param *params, bool display)
 {
     struct priv *p = ctx->priv;
+    if (!display) {
+        if (p->pending)
+            CFRelease(p->pending);
+        p->pending = NULL;
+        mpv_apple_native_target *target = get_mpv_render_param(
+            params, MPV_RENDER_PARAM_APPLE_NATIVE_TARGET, NULL);
+        if (target->osd)
+            CGImageRelease(target->osd);
+        target->osd = NULL;
+        target->video_rect = CGRectMake(0, 0, target->w, target->h);
+        target->contents_rect = CGRectMake(0, 0, 1, 1);
+        return 0;
+    }
     if (!p->pending)
         return 0;
     AVSampleBufferVideoRenderer *renderer = (__bridge id)p->renderer;
@@ -294,6 +387,7 @@ static void destroy(struct render_backend *ctx)
 
 const struct render_backend_fns render_backend_apple = {
     .init = init,
+    .select_native = select_native,
     .check_format = check_format,
     .set_parameter = set_parameter,
     .reconfig = reconfig,

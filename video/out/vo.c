@@ -663,7 +663,15 @@ static void run_control(void *p)
     int request = (intptr_t)pp[1];
     void *data = pp[2];
     update_opts(vo);
+    bool was_native = vo->caps & VO_CAP_NATIVE_OUTPUT;
     int ret = vo->driver->control(vo, request, data);
+    if (request == VOCTRL_SELECT_OUTPUT && (was_native || vo->caps & VO_CAP_NATIVE_OUTPUT)) {
+        // Unlike a seek, a stream replacement must not redraw the old frame.
+        mp_mutex_lock(&vo->in->lock);
+        TA_FREEP(&vo->in->current_frame);
+        forget_frames(vo);
+        mp_mutex_unlock(&vo->in->lock);
+    }
     if (pp[3])
         *(int *)pp[3] = ret;
 }

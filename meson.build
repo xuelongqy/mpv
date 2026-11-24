@@ -237,6 +237,7 @@ sources = files(
     'video/out/dither.c',
     'video/out/dr_helper.c',
     'video/out/filter_kernels.c',
+    'video/out/libmpv_native.c',
     'video/out/terminal_swapchain.c',
     'video/out/gpu/context.c',
     'video/out/gpu/error_diffusion.c',
@@ -502,6 +503,7 @@ if features['android']
     sources += files('misc/jni.c',
                      'osdep/android/strnlen.c',
                      'video/out/android_common.c',
+                     'video/out/libmpv_android.c',
                      'video/out/vo_mediacodec_embed.c')
 endif
 
@@ -870,7 +872,7 @@ if features['avfoundation']
 endif
 
 apple_native = dependency('appleframeworks', modules: ['Foundation', 'AVFoundation',
-                          'CoreMedia', 'CoreVideo', 'CoreGraphics', 'QuartzCore'],
+                          'CoreMedia', 'CoreVideo', 'CoreGraphics', 'QuartzCore', 'VideoToolbox'],
                           required: get_option('apple-native').require(darwin))
 features += {'apple-native': apple_native.found()}
 if features['apple-native']
@@ -1865,6 +1867,12 @@ if get_option('libmpv')
     headers = ['include/mpv/client.h', 'include/mpv/render.h',
                'include/mpv/render_d3d11.h', 'include/mpv/render_gl.h',
                'include/mpv/render_vk.h', 'include/mpv/stream_cb.h']
+    if darwin
+        headers += 'include/mpv/render_apple.h'
+    endif
+    if features['android']
+        headers += 'include/mpv/render_android.h'
+    endif
     install_headers(headers, subdir: 'mpv')
 
     # Allow projects to build with libmpv by cloning into ./subprojects/mpv

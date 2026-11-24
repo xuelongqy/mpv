@@ -290,7 +290,7 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
         mpctx->mouse_cursor_visible = true;
     }
 
-    if (mpctx->video_out->caps & VO_CAP_AUTO_OUTPUT) {
+    if (mpctx->video_out->caps & (VO_CAP_AUTO_OUTPUT | VO_CAP_NATIVE_OUTPUT)) {
         if (vo_control(mpctx->video_out, VOCTRL_SELECT_OUTPUT,
                        track ? track->stream->codec : NULL) != VO_TRUE) {
             mpctx->error_playing = MPV_ERROR_VO_INIT_FAILED;
@@ -622,7 +622,7 @@ static bool check_for_hwdec_fallback(struct MPContext *mpctx)
     return true;
 }
 
-static bool check_for_forced_eof(struct MPContext *mpctx)
+static int check_for_forced_eof(struct MPContext *mpctx)
 {
     struct vo_chain *vo_c = mpctx->vo_chain;
 
@@ -632,7 +632,9 @@ static bool check_for_forced_eof(struct MPContext *mpctx)
     struct mp_decoder_wrapper *dec = vo_c->track->dec;
     bool forced_eof = false;
 
-    mp_decoder_wrapper_control(dec, VDCTRL_CHECK_FORCED_EOF, &forced_eof);
+    // The decoder can distinguish a terminal native failure from forced EOF.
+    if (mp_decoder_wrapper_control(dec, VDCTRL_CHECK_FORCED_EOF, &forced_eof) == CONTROL_ERROR)
+        return -1;
     return forced_eof;
 }
 
@@ -1138,7 +1140,12 @@ void write_video(struct MPContext *mpctx)
     if (r == VD_EOF) {
         if (check_for_hwdec_fallback(mpctx))
             return;
-        if (check_for_forced_eof(mpctx)) {
+        int forced_eof = check_for_forced_eof(mpctx);
+        if (forced_eof < 0) {
+            mpctx->error_playing = MPV_ERROR_VO_INIT_FAILED;
+            goto error;
+        }
+        if (forced_eof) {
             uninit_video_chain(mpctx);
             handle_force_window(mpctx, true);
             return;

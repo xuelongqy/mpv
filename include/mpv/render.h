@@ -466,31 +466,43 @@ typedef enum mpv_render_param_type {
      */
     MPV_RENDER_PARAM_VULKAN_RETIRE_TARGET = 24,
     /**
-     * Experimental output policy, for create() only. Type: char*.
-     * "render" preserves the existing renderer selection. "native" selects
-     * the platform output API and cannot be combined with RENDERER.
-     * "auto" prefers native DV on supported Apple outputs, otherwise render.
-     * It requires ADVANCED_CONTROL=1. API_TYPE and RENDERER configure the
-     * render fallback; an optional APPLE_NATIVE_INIT_PARAMS supplies the
-     * native output. Without RENDERER, gpu-next is tried before gpu/software.
-     * Software/old gpu are not safe fallbacks for DV. No API or device is
-     * created on the caller's behalf.
-     * Linux currently has no native Render API backend: "native" returns
-     * MPV_ERROR_NOT_IMPLEMENTED, while "auto" uses render output. For GPU
-     * output, the caller still supplies the GL/Vulkan context and configures
-     * HDR presentation; selecting "auto" does not enable system HDR or provide
-     * DV passthrough.
-     * Omission preserves the existing API/default renderer behavior.
-     * For get_info(), data is const char** and receives the actual output
-     * mode ("render", "native" or transient "recovering"), as a static string.
-     * Experimental clients must query this before playback; older libraries
-     * ignore unknown create parameters but return NOT_IMPLEMENTED for this query.
+     * Output policy, since API 2.9. For create(), data points to a NUL-terminated
+     * string. "render" and omission keep the existing renderer selection for
+     * the requested API. "native" requires the platform API and excludes RENDERER.
+     * "auto" requires ADVANCED_CONTROL=1. API_TYPE and RENDERER configure
+     * the render fallback. Without RENDERER, gpu-next is tried before gpu/software.
+     * Platform initialization enables selection of native output. For the
+     * platform-specific selection rules, see render_apple.h or render_android.h.
+     * The caller supplies the graphics context and configures HDR presentation
+     * for GPU output. Builds with no native backend return MPV_ERROR_NOT_IMPLEMENTED
+     * for explicit "native" and can create "auto" with a render backend.
+     *
+     * For get_info(), data is const char**. On success it receives a static
+     * string ("render", "native" or transient "recovering"). In "auto", query
+     * after update() and before acquiring a target. During "recovering", continue
+     * servicing update callbacks and client events without acquiring a target.
+     * Check the client API version before relying on the policy. Older libraries
+     * may ignore unknown create parameters.
      */
     MPV_RENDER_PARAM_OUTPUT_MODE = 25,
-    /** Experimental Apple native context. See render_apple.h. */
+    /** Apple native initialization for create(). Type: mpv_apple_native_init_params*. */
     MPV_RENDER_PARAM_APPLE_NATIVE_INIT_PARAMS = 26,
-    /** Experimental Apple native target. See render_apple.h. */
+    /** In/out Apple native target for render(). Type: mpv_apple_native_target*. */
     MPV_RENDER_PARAM_APPLE_NATIVE_TARGET = 27,
+    /** Android native initialization for create(). Type: mpv_android_native_init_params*. */
+    MPV_RENDER_PARAM_ANDROID_NATIVE_INIT_PARAMS = 28,
+    /** In/out Android native target for render(). Type: mpv_android_native_target*. */
+    MPV_RENDER_PARAM_ANDROID_NATIVE_TARGET = 29,
+    /**
+     * HDR10 capability of the display hosting the native video view.
+     * Type: int* (0 or 1). Valid for create() and set_parameter().
+     * Update before presenting on a different display. A value of 0 causes
+     * a stream selected as native HDR10 to recover to the configured render
+     * backend, or stop if there is no fallback. A value of 1 is considered
+     * the next time a video output is selected. For platform defaults and
+     * eligibility requirements, see render_apple.h and render_android.h.
+     */
+    MPV_RENDER_PARAM_DISPLAY_HDR10_CAPABLE = 30,
     /**
      * Required parameters for initializing the Direct3D 11 renderer. Valid
      * for mpv_render_context_create() with API_TYPE "d3d11".
@@ -553,7 +565,10 @@ typedef struct mpv_render_param {
 // See section "Software renderer"
 #define MPV_RENDER_API_TYPE_SW "sw"
 #define MPV_RENDER_API_TYPE_VULKAN "vulkan"
+// See render_apple.h (Apple only)
 #define MPV_RENDER_API_TYPE_APPLE_NATIVE "apple-native"
+// See render_android.h (Android only)
+#define MPV_RENDER_API_TYPE_ANDROID_NATIVE "android-native"
 
 /**
  * Flags used in mpv_render_frame_info.flags. Each value represents a bit in it.

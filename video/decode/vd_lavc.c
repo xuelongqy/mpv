@@ -53,6 +53,7 @@
 #include "video/csputils.h"
 #include "video/sws_utils.h"
 #include "video/out/vo.h"
+#include "video/out/libmpv.h"
 
 #include "options/m_option.h"
 
@@ -217,6 +218,10 @@ typedef struct lavc_ctx {
     bool hwdec_failed;
     bool hwdec_notified;
     bool force_eof;
+    bool native_frames_emitted;
+    bool native_replay_incomplete;
+    bool native_output_failed;
+    bool native_recovery_pending;
     int wait_for_keyframe; // max number of frames to wait for keyframe after reset
 
     bool intra_only;
@@ -506,14 +511,18 @@ static void select_and_set_hwdec(struct mp_filter *vd)
     const char *codec = ctx->codec->codec;
 
     m_config_cache_update(ctx->hwdec_opts_cache);
+    ctx->force_eof = false;
 
     struct hwdec_info *hwdecs = NULL;
     int num_hwdecs = 0;
     add_all_hwdec_methods(&hwdecs, &num_hwdecs);
 
     char **hwdec_api = ctx->hwdec_opts->hwdec_api;
-    char *native_api[] = {"videotoolbox", NULL};
-    bool native = ctx->vo && (ctx->vo->caps & VO_CAP_NATIVE_VIDEOTOOLBOX);
+    int vo_caps = ctx->vo ? ctx->vo->caps : 0;
+    bool native = vo_caps & VO_CAP_NATIVE_OUTPUT;
+    char *native_api[] = {
+        vo_caps & VO_CAP_NATIVE_MEDIACODEC ? "mediacodec" : "videotoolbox", NULL,
+    };
     if (native)
         hwdec_api = native_api;
     for (int i = 0; hwdec_api && hwdec_api[i]; i++) {
@@ -684,27 +693,86 @@ static int hwdec_opt_help(struct mp_log *log, const m_option_t *opt,
     return M_OPT_EXIT;
 }
 
+static bool native_output(vd_ffmpeg_ctx *ctx)
+{
+    return ctx->vo && (ctx->vo->caps & VO_CAP_NATIVE_OUTPUT);
+}
+
+static bool fallback_output(struct mp_filter *vd, bool rebuild)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+    if (!native_output(ctx))
+        return true;
+
+    int result = VO_NOTAVAIL;
+    if (ctx->vo->caps & VO_CAP_AUTO_OUTPUT) {
+        struct voctrl_fallback_output request = { .codec = ctx->codec, .rebuild = rebuild };
+        result = vo_control(ctx->vo, VOCTRL_FALLBACK_OUTPUT, &request);
+    }
+    if (result != VO_TRUE) {
+        ctx->native_recovery_pending = result == VO_FALSE;
+        ctx->force_eof = ctx->native_output_failed = !ctx->native_recovery_pending;
+        return false;
+    }
+
+    ctx->hwdec_devs = ctx->vo->hwdec_devs;
+    // The render fallback can provide a different device for the same decoder.
+    TA_FREEP(&ctx->attempted_hwdecs);
+    ctx->num_attempted_hwdecs = 0;
+    return true;
+}
+
+static void open_decoder(struct mp_filter *vd, bool rebuild)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+    bool started_native = native_output(ctx);
+    // A demux segment can replace the decoder without reselecting the output.
+    if (started_native && (ctx->vo->caps & VO_CAP_NATIVE_HDR10) &&
+        !mp_native_hdr10_codec(ctx->codec)) {
+        MP_VERBOSE(vd, "Stream is incompatible with the selected native HDR10 output.\n");
+        if (!fallback_output(vd, rebuild))
+            return;
+    }
+    while (true) {
+        select_and_set_hwdec(vd);
+        bool hwdec = ctx->use_hwdec;
+        // Native output cannot use a software decoder, even during probing.
+        if (!native_output(ctx) || hwdec)
+            init_avctx(vd);
+        if (ctx->avctx || (!hwdec && !native_output(ctx)))
+            break;
+        if (!fallback_output(vd, rebuild))
+            return;
+    }
+    if (started_native && (!ctx->avctx || ctx->force_eof))
+        ctx->native_output_failed = true;
+}
+
 static void force_fallback(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
+    bool was_native = native_output(ctx);
+    bool rebuild = ctx->native_frames_emitted || ctx->native_replay_incomplete;
 
-    uninit_avctx(vd);
-    if (ctx->vo && (ctx->vo->caps & VO_CAP_AUTO_OUTPUT) &&
-        (ctx->vo->caps & VO_CAP_NATIVE_VIDEOTOOLBOX)) {
-        if (vo_control(ctx->vo, VOCTRL_FALLBACK_OUTPUT, NULL) == VO_TRUE)
-            ctx->hwdec_devs = ctx->vo->hwdec_devs;
-    }
     int lev = ctx->hwdec_notified ? MSGL_WARN : MSGL_V;
     mp_msg(vd->log, lev, "Attempting next decoding method after failure of %.*s.\n",
            BSTR_P(ctx->attempted_hwdecs[ctx->num_attempted_hwdecs - 1]));
-    select_and_set_hwdec(vd);
-    init_avctx(vd);
+    uninit_avctx(vd);
+    if (fallback_output(vd, rebuild)) {
+        open_decoder(vd, rebuild);
+        if (was_native && (!ctx->avctx || ctx->force_eof))
+            ctx->native_output_failed = true;
+    }
 }
 
 static void reinit(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
+    if (ctx->native_recovery_pending)
+        return;
 
+    bool rebuild = ctx->native_frames_emitted || ctx->native_replay_incomplete ||
+                   ctx->num_sent_packets;
     uninit_avctx(vd);
 
     /*
@@ -716,16 +784,9 @@ static void reinit(struct mp_filter *vd)
     TA_FREEP(&ctx->attempted_hwdecs);
     ctx->num_attempted_hwdecs = 0;
     ctx->hwdec_notified = false;
+    ctx->native_output_failed = false;
 
-    select_and_set_hwdec(vd);
-
-    bool use_hwdec = ctx->use_hwdec;
-    init_avctx(vd);
-    if (!ctx->avctx && use_hwdec) {
-        do {
-            force_fallback(vd);
-        } while (!ctx->avctx);
-    }
+    open_decoder(vd, rebuild);
 
     // Wait for the first keyframe after reinit to ensure the decoder state is
     // valid and to avoid decoding errors that could cause hwdec to fail and
@@ -879,18 +940,24 @@ static void init_avctx(struct mp_filter *vd)
         goto error;
     }
 
-    if (ctx->vo && (ctx->vo->caps & VO_CAP_NATIVE_VIDEOTOOLBOX) &&
-        lavc_codec->id == AV_CODEC_ID_HEVC) {
+    int vo_caps = ctx->vo ? ctx->vo->caps : 0;
+    if (vo_caps & VO_CAP_NATIVE_MEDIACODEC) {
+        // The hwdevice carries a Java Surface. The JNI codec path also requires
+        // a matching hardware decoder instead of falling back to a software codec.
+        av_opt_set_int(avctx, "ndk_codec", 0, AV_OPT_SEARCH_CHILDREN);
+    }
+    if ((vo_caps & VO_CAP_NATIVE_VIDEOTOOLBOX) && lavc_codec->id == AV_CODEC_ID_HEVC) {
         const AVPacketSideData *dovi = av_packet_side_data_get(
             avctx->coded_side_data, avctx->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF);
         if (dovi && av_opt_set_int(avctx, "vt_native_dv", 1, AV_OPT_SEARCH_CHILDREN) < 0) {
             MP_ERR(vd, "Native DV needs a compatible VideoToolbox decoder.\n");
             goto error;
         }
-    } else if (ctx->vo && (ctx->vo->caps & VO_CAP_AUTO_OUTPUT) &&
+    } else if ((vo_caps & (VO_CAP_AUTO_OUTPUT | VO_CAP_NATIVE_MEDIACODEC)) &&
                lavc_codec->id == AV_CODEC_ID_HEVC) {
         // A render fallback must not receive pixels already processed as native DV.
         av_opt_set_int(avctx, "vt_native_dv", 0, AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(avctx, "mc_native_dv", 0, AV_OPT_SEARCH_CHILDREN);
     }
 
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
@@ -948,6 +1015,7 @@ static void flush_all(struct mp_filter *vd)
     for (int n = 0; n < ctx->num_sent_packets; n++)
         talloc_free(ctx->sent_packets[n]);
     ctx->num_sent_packets = 0;
+    ctx->native_replay_incomplete = false;
 
     for (int n = 0; n < ctx->num_requeue_packets; n++)
         talloc_free(ctx->requeue_packets[n]);
@@ -1273,17 +1341,25 @@ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
 
     mp_set_av_packet(ctx->avpkt, pkt, &ctx->codec_timebase);
 
-    int ret = avcodec_send_packet(avctx, pkt ? ctx->avpkt : NULL);
+    bool reject_hdr10 = pkt && ctx->vo && (ctx->vo->caps & VO_CAP_NATIVE_HDR10) &&
+        !mp_native_hdr10_packet(ctx->codec->lav_codecpar, ctx->avpkt);
+    int ret = reject_hdr10 ? 0 : avcodec_send_packet(avctx, pkt ? ctx->avpkt : NULL);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
         return ret;
 
-    if (ctx->hw_probing && ctx->num_sent_packets < 32 &&
-        ctx->hwdec_opts->software_fallback <= 32)
-    {
-        pkt = pkt ? demux_copy_packet(vd->packet_pool, pkt) : NULL;
-        MP_TARRAY_APPEND(ctx, ctx->sent_packets, ctx->num_sent_packets, pkt);
+    if (ctx->hw_probing && (native_output(ctx) || ctx->hwdec_opts->software_fallback <= 32)) {
+        if (ctx->num_sent_packets < 32) {
+            pkt = pkt ? demux_copy_packet(vd->packet_pool, pkt) : NULL;
+            MP_TARRAY_APPEND(ctx, ctx->sent_packets, ctx->num_sent_packets, pkt);
+        } else if (pkt && native_output(ctx)) {
+            ctx->native_replay_incomplete = true;
+        }
     }
 
+    if (reject_hdr10) {
+        MP_VERBOSE(vd, "Packet is incompatible with native HDR10 output.\n");
+        ctx->hwdec_failed = true;
+    }
     if (ret < 0)
         handle_err(vd);
     return ret;
@@ -1370,27 +1446,25 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
 
     int ret = decode_frame(vd);
 
-    if (ctx->hwdec_failed) {
+    bool native_probe_eof = native_output(ctx) && ctx->hw_probing &&
+        ret == AVERROR_EOF && ctx->num_sent_packets && !ctx->num_delay_queue;
+    if (ctx->hwdec_failed || native_probe_eof) {
         // Failed hardware decoding? Try the next one, and eventually software.
         struct demux_packet **pkts = ctx->sent_packets;
         int num_pkts = ctx->num_sent_packets;
         ctx->sent_packets = NULL;
         ctx->num_sent_packets = 0;
 
-        /*
-         * We repeatedly force_fallback until we get an avctx, because there are
-         * certain hwdecs that are really full decoders, and so if these fail,
-         * they also fail to give us a valid avctx, and the early return path
-         * here will simply give up on decoding completely if there is no
-         * decoder. We should never hit an infinite loop as the hwdec list is
-         * finite and we will eventually exhaust it and fall back to software
-         * decoding (and in practice, most hwdecs are hwaccels and so the
-         * decoder will successfully init even if the hwaccel fails later.)
-         */
-        do {
-            force_fallback(vd);
-        } while (!ctx->avctx);
+        force_fallback(vd);
+        if (!ctx->avctx || ctx->force_eof) {
+            for (int n = 0; n < num_pkts; n++)
+                demux_packet_pool_push(vd->packet_pool, pkts[n]);
+            talloc_free(pkts);
+            // The core owns the rebuild. An EOF could release seek preroll.
+            return ctx->native_recovery_pending ? 0 : AVERROR_EOF;
+        }
 
+        TA_FREEP(&ctx->requeue_packets);
         ctx->requeue_packets = pkts;
         ctx->num_requeue_packets = num_pkts;
 
@@ -1442,6 +1516,7 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
         ctx->hw_probing = false;
     }
 
+    ctx->native_frames_emitted |= native_output(ctx);
     *out_frame = MAKE_FRAME(MP_FRAME_VIDEO, res);
     return 0;
 }
@@ -1458,7 +1533,7 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
         return CONTROL_TRUE;
     case VDCTRL_CHECK_FORCED_EOF: {
         *(bool *)arg = ctx->force_eof;
-        return CONTROL_TRUE;
+        return ctx->native_output_failed ? CONTROL_ERROR : CONTROL_TRUE;
     }
     case VDCTRL_GET_BFRAMES: {
         AVCodecContext *avctx = ctx->avctx;
@@ -1474,11 +1549,13 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
         return CONTROL_TRUE;
     }
     case VDCTRL_FORCE_HWDEC_FALLBACK:
-        if (ctx->use_hwdec) {
-            force_fallback(vd);
-            return ctx->avctx ? CONTROL_OK : CONTROL_ERROR;
-        }
-        return CONTROL_FALSE;
+        if (ctx->native_recovery_pending)
+            return CONTROL_OK;
+        if (!ctx->use_hwdec)
+            return CONTROL_FALSE;
+        force_fallback(vd);
+        return ctx->native_recovery_pending || (ctx->avctx && !ctx->native_output_failed)
+            ? CONTROL_OK : CONTROL_ERROR;
     case VDCTRL_REINIT:
         reinit(vd);
         return CONTROL_TRUE;
@@ -1490,7 +1567,8 @@ static void vd_lavc_process(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
 
-    lavc_process(vd, &ctx->state, send_packet, receive_frame);
+    if (!ctx->native_recovery_pending)
+        lavc_process(vd, &ctx->state, send_packet, receive_frame);
 }
 
 static void vd_lavc_reset(struct mp_filter *vd)
@@ -1559,12 +1637,13 @@ static struct mp_decoder *create(struct mp_filter *parent,
 
     reinit(vd);
 
-    if (!ctx->avctx) {
+    if ((!ctx->avctx && !ctx->native_recovery_pending) || ctx->native_output_failed) {
         talloc_free(vd);
         return NULL;
     }
 
-    codec->codec_desc = ctx->avctx->codec_descriptor->long_name;
+    if (ctx->avctx)
+        codec->codec_desc = ctx->avctx->codec_descriptor->long_name;
 
     return &ctx->public;
 }

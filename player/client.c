@@ -2180,32 +2180,42 @@ void kill_video_async(struct mp_client_api *client_api)
     mp_dispatch_enqueue(mpctx->dispatch, do_kill, mpctx);
 }
 
-struct output_fallback {
+struct output_failure {
     struct mp_client_api *api;
     mpv_render_context *ctx;
     uint64_t serial;
 };
 
-static void do_fallback(void *ptr)
+static void handle_output_failure(void *ptr)
 {
-    struct output_fallback *args = ptr;
+    struct output_failure *args = ptr;
     struct mp_client_api *api = args->api;
     mp_mutex_lock(&api->lock);
     bool current = api->render_context == args->ctx;
     mp_mutex_unlock(&api->lock);
     struct MPContext *mpctx = api->mpctx;
+    bool try_render;
     // The current VO retains its context while this core-thread callback runs.
     if (current && mpctx->vo_chain && mpctx->video_out &&
-        (mpctx->video_out->caps & VO_CAP_AUTO_OUTPUT) &&
-        mp_render_context_can_fallback(args->ctx, args->serial)) {
+        (mpctx->video_out->caps & (VO_CAP_AUTO_OUTPUT | VO_CAP_NATIVE_OUTPUT)) &&
+        mp_render_context_get_recovery(args->ctx, args->serial, &try_render)) {
         struct track *track = mpctx->vo_chain->track;
-        double pts = mpctx->video_pts;
-        // Discard all native frames before opening a normal decoder at the same PTS.
+        double pts = get_current_time(mpctx);
+        if (mpctx->hrseek_active) {
+            pts = mpctx->last_seek_pts;
+        } else if (mpctx->video_pts != MP_NOPTS_VALUE) {
+            pts = mpctx->video_pts * mpctx->play_dir;
+        }
+        // Discard native frames from the decoder, filters, core and VO together.
         uninit_video_out(mpctx);
-        if (track && track->stream && pts != MP_NOPTS_VALUE && mpctx->demuxer->seekable) {
+        if (try_render && track && track->stream && pts != MP_NOPTS_VALUE &&
+            mpctx->demuxer && mpctx->demuxer->seekable) {
+            MP_WARN(mpctx, "Native output failed; reopening normal decoding for render output.\n");
             reinit_video_chain_src(mpctx, track);
-            queue_seek(mpctx, MPSEEK_ABSOLUTE, pts, MPSEEK_EXACT, 0);
+            if (mpctx->vo_chain)
+                queue_seek(mpctx, MPSEEK_ABSOLUTE, pts, MPSEEK_EXACT, 0);
         } else if (track) {
+            MP_ERR(mpctx, "Video output failed and playback cannot recover at the current position.\n");
             mpctx->error_playing = MPV_ERROR_VO_INIT_FAILED;
             error_on_track(mpctx, track);
         }
@@ -2213,12 +2223,12 @@ static void do_fallback(void *ptr)
     talloc_free(ptr);
 }
 
-void fallback_video_async(struct mp_client_api *client_api, mpv_render_context *ctx,
-                           uint64_t serial)
+void video_output_failed_async(struct mp_client_api *client_api,
+                                mpv_render_context *ctx, uint64_t serial)
 {
-    struct output_fallback *args = talloc_ptrtype(NULL, args);
-    *args = (struct output_fallback){client_api, ctx, serial};
-    mp_dispatch_enqueue(client_api->mpctx->dispatch, do_fallback, args);
+    struct output_failure *args = talloc_ptrtype(NULL, args);
+    *args = (struct output_failure){client_api, ctx, serial};
+    mp_dispatch_enqueue(client_api->mpctx->dispatch, handle_output_failure, args);
 }
 
 // Used by vo_libmpv to set the current render context.

@@ -20,6 +20,7 @@
 #include <libavutil/hwcontext_mediacodec.h>
 #include <android/native_window_jni.h>
 
+#include "android_common.h"
 #include "common/common.h"
 #include "misc/jni.h"
 #include "options/m_option.h"
@@ -58,57 +59,9 @@ static bool draw_osd(struct vo *vo, bool clear)
     vo_get_src_dst_rects(vo, &src, &dst, &p->osd_res);
     p->osd_res.w = w;
     p->osd_res.h = h;
-    struct sub_bitmap_list *list = clear ? NULL :
-        osd_render(vo->osd, p->osd_res, p->osd_pts, 0, mp_draw_sub_formats);
-    int64_t id = list ? list->change_id : 0;
-    if (p->osd_id == id) {
-        talloc_free(list);
-        return true;
-    }
-
-    struct mp_image *overlay = NULL;
-    if (list && list->num_items) {
-        struct mp_rect active, modified;
-        int num_active, num_modified;
-        overlay = mp_draw_sub_overlay(p->osd_cache, list,
-            &active, 1, &num_active, &modified, 1, &num_modified);
-        if (!overlay) {
-            talloc_free(list);
-            return false;
-        }
-    }
-    ANativeWindow_Buffer buffer;
-    if (ANativeWindow_lock(p->osd_window, &buffer, NULL) < 0) {
-        MP_ERR(vo, "Could not lock the OSD Surface.\n");
-        talloc_free(list);
-        return false;
-    }
-    if (buffer.format != WINDOW_FORMAT_RGBA_8888 || !buffer.bits ||
-        buffer.width <= 0 || buffer.height <= 0 || buffer.stride < buffer.width) {
-        ANativeWindow_unlockAndPost(p->osd_window);
-        talloc_free(list);
-        return false;
-    }
-    bool valid = buffer.width == w && buffer.height == h;
-    for (int y = 0; y < buffer.height; y++) {
-        uint8_t *out = (uint8_t *)buffer.bits + (size_t)y * buffer.stride * 4;
-        if (!valid || !overlay) {
-            memset(out, 0, (size_t)buffer.stride * 4);
-            continue;
-        }
-        const uint8_t *in = overlay->planes[0] + (size_t)y * overlay->stride[0];
-        for (int x = 0; x < w; x++) {
-            out[4*x+0] = in[4*x+2];
-            out[4*x+1] = in[4*x+1];
-            out[4*x+2] = in[4*x+0];
-            out[4*x+3] = in[4*x+3];
-        }
-    }
-    bool posted = ANativeWindow_unlockAndPost(p->osd_window) == 0;
-    if (valid && posted)
-        p->osd_id = id;
-    talloc_free(list);
-    return valid && posted;
+    return android_draw_osd(vo->log, p->osd_window, p->osd_cache,
+                            clear ? NULL : vo->osd, &p->osd_res, p->osd_pts,
+                            &p->osd_id);
 }
 
 static AVBufferRef *create_mediacodec_device_ref(struct vo *vo)

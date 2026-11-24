@@ -79,8 +79,8 @@ enum mp_voctrl {
     VOCTRL_PREINIT,
     VOCTRL_UNINIT,
     VOCTRL_RECONFIG,
-    VOCTRL_SELECT_OUTPUT,               // struct mp_codec_params*, libmpv auto only
-    VOCTRL_FALLBACK_OUTPUT,             // libmpv auto only
+    VOCTRL_SELECT_OUTPUT,               // struct mp_codec_params*, libmpv native/auto
+    VOCTRL_FALLBACK_OUTPUT,             // struct voctrl_fallback_output*, libmpv auto
 
     VOCTRL_UPDATE_WINDOW_TITLE,         // char*
     VOCTRL_UPDATE_PLAYBACK_STATE,       // struct voctrl_playback_state*
@@ -150,6 +150,12 @@ enum mp_content_type {
 #define VO_NOTAVAIL     -2
 #define VO_NOTIMPL      -3
 
+// VOCTRL_FALLBACK_OUTPUT
+struct voctrl_fallback_output {
+    const struct mp_codec_params *codec;
+    bool rebuild;
+};
+
 // VOCTRL_UPDATE_PLAYBACK_STATE
 struct voctrl_playback_state {
     bool taskbar_progress;
@@ -210,6 +216,10 @@ enum {
     // Native Apple output needs direct VideoToolbox frames and their metadata.
     VO_CAP_NATIVE_VIDEOTOOLBOX = 1 << 7,
     VO_CAP_AUTO_OUTPUT = 1 << 8,
+    // The Render API Android backend feeds a MediaCodec Surface directly.
+    VO_CAP_NATIVE_MEDIACODEC = 1 << 9,
+    VO_CAP_NATIVE_HDR10 = 1 << 10,
+    VO_CAP_NATIVE_OUTPUT = VO_CAP_NATIVE_VIDEOTOOLBOX | VO_CAP_NATIVE_MEDIACODEC,
 };
 
 enum {

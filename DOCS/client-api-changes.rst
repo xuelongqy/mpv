@@ -33,6 +33,19 @@ API changes
 ::
 
  --- downstream branch (not an upstream API release) ---
+ 2.9    - stabilize the Apple Native Render API v1 and install render_apple.h on Apple
+        - add the output policy, Apple initialization and Apple target parameters
+          to the public contract at their existing values (25, 26 and 27)
+        - add the Android Native Render API v1 and install render_android.h on
+          Android. Android initialization and target parameters use 28 and 29.
+        - with opt-in auto output, prefer native VideoToolbox or MediaCodec
+          presentation for verified HDR10, with gpu-next as the default render
+          fallback. Display HDR10 capability uses parameter 30. Android and
+          macOS callers report capability for the video view's current display.
+          Physical iOS devices default to their system HDR eligibility check.
+          Existing Apple Dolby Vision selection remains available.
+        - Apple native support remains an optional build feature. Applications
+          check the client API version and context creation. See render_apple.h.
  2.8    - freeze the downstream Vulkan Render API v1 ABI and caller contract
         - add MPV_VULKAN_API_VERSION=1; retain MPV_VULKAN_DRAFT_VERSION as an alias
         - preserve the 2.7/draft 1 structure layouts, parameter numbers and behavior
