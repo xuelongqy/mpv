@@ -68,6 +68,7 @@ static int hwdec_opt_help(struct mp_log *log, const m_option_t *opt,
 
 #define HWDEC_DELAY_QUEUE_COUNT 4
 #define HWDEC_WAIT_KEYFRAME_COUNT 96
+#define HWDEC_PROBE_PACKETS 32
 
 // Fallback number of extra surfaces for fixed-size hw frame pools, if the
 // actual requirement cannot be determined.
@@ -222,7 +223,12 @@ typedef struct lavc_ctx {
     bool native_replay_incomplete;
     bool native_output_failed;
     bool native_recovery_pending;
-    int wait_for_keyframe; // max number of frames to wait for keyframe after reset
+    // Positive for a bounded wait after reset, -1 if fallback requires a keyframe.
+    int wait_for_keyframe;
+
+    bool dovi;
+    bool check_dovi_packets;
+    unsigned hevc_nal_length_size;
 
     bool intra_only;
     int framedrop_flags;
@@ -465,6 +471,27 @@ static bool hwdec_codec_allowed(struct mp_filter *vd, const char *codec)
     return false;
 }
 
+static bool codec_has_dovi(const struct mp_codec_params *codec)
+{
+    const AVCodecParameters *params = codec->lav_codecpar;
+    if (codec->dovi || (params && av_packet_side_data_get(
+            params->coded_side_data, params->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF)))
+        return true;
+
+    unsigned tag = codec->codec_tag;
+    if (strcmp(codec->codec, "hevc") == 0)
+        return tag == MKTAG('d', 'v', 'h', '1') || tag == MKTAG('d', 'v', 'h', 'e');
+    if (strcmp(codec->codec, "h264") == 0)
+        return tag == MKTAG('d', 'v', 'a', '1') || tag == MKTAG('d', 'v', 'a', 'v');
+    return false;
+}
+
+static bool hwdec_is_mediacodec(const struct hwdec_info *hwdec)
+{
+    return strcmp(hwdec->method_name, "mediacodec") == 0 ||
+           strcmp(hwdec->method_name, "mediacodec-copy") == 0;
+}
+
 static AVBufferRef *hwdec_create_dev(struct mp_filter *vd,
                                      struct hwdec_info *hwdec,
                                      bool autoprobe)
@@ -579,6 +606,12 @@ static void select_and_set_hwdec(struct mp_filter *vd)
 
                 if (hwdec_auto_safe && !(hwdec->flags & HWDEC_FLAG_WHITELIST))
                     continue;
+
+                // These decoders do not pass Dolby Vision RPU metadata to the renderer.
+                if (ctx->dovi && hwdec_is_mediacodec(hwdec)) {
+                    MP_VERBOSE(vd, "Skipping %s for Dolby Vision.\n", hwdec->method_name);
+                    continue;
+                }
 
                 MP_VERBOSE(vd, "Looking at hwdec %s...\n", hwdec->name);
 
@@ -939,6 +972,14 @@ static void init_avctx(struct mp_filter *vd)
         MP_ERR(vd, "Could not set codec parameters.\n");
         goto error;
     }
+
+    // Native HDR10 output has its own, stricter packet checks and recovery.
+    ctx->check_dovi_packets = ctx->use_hwdec && hwdec_is_mediacodec(&ctx->hwdec) &&
+                              !native_output(ctx);
+    ctx->hevc_nal_length_size = 0;
+    if (ctx->check_dovi_packets && avctx->codec_id == AV_CODEC_ID_HEVC)
+        ctx->hevc_nal_length_size = mp_hevc_nal_length_size(avctx->extradata,
+                                                           avctx->extradata_size);
 
     int vo_caps = ctx->vo ? ctx->vo->caps : 0;
     if (vo_caps & VO_CAP_NATIVE_MEDIACODEC) {
@@ -1311,6 +1352,37 @@ static void handle_err(struct mp_filter *vd)
     }
 }
 
+static void discard_probe_packets(struct mp_filter *vd)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+    for (int n = 0; n < ctx->num_sent_packets; n++)
+        demux_packet_pool_push(vd->packet_pool, ctx->sent_packets[n]);
+    ctx->num_sent_packets = 0;
+}
+
+static void reject_dovi_packet(struct mp_filter *vd, struct demux_packet *pkt)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+    // Replay only a complete prefix starting at a keyframe. If the probe ended
+    // or ran out of space, restart from this packet if it is a keyframe.
+    bool replay = ctx->num_sent_packets > 0 &&
+                  ctx->num_sent_packets < HWDEC_PROBE_PACKETS &&
+                  ctx->sent_packets[0] && ctx->sent_packets[0]->keyframe;
+    for (int n = 1; replay && n < ctx->num_sent_packets; n++)
+        replay = ctx->sent_packets[n] != NULL;
+
+    struct demux_packet *copy = NULL;
+    if (replay || pkt->keyframe)
+        copy = demux_copy_packet(vd->packet_pool, pkt);
+    if (!replay || !copy)
+        discard_probe_packets(vd);
+    if (copy)
+        MP_TARRAY_APPEND(ctx, ctx->sent_packets, ctx->num_sent_packets, copy);
+
+    MP_VERBOSE(vd, "Found Dolby Vision in a MediaCodec input packet.\n");
+    ctx->dovi = ctx->hwdec_failed = true;
+}
+
 static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
@@ -1327,10 +1399,11 @@ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
 
     prepare_decoding(vd);
 
-    if (ctx->wait_for_keyframe > 0 && pkt) {
+    if (ctx->wait_for_keyframe && pkt) {
         if (!pkt->keyframe && !ctx->intra_only) {
             MP_DBG(vd, "Waiting for keyframe after reinit (dropping frame).\n");
-            ctx->wait_for_keyframe--;
+            if (ctx->wait_for_keyframe > 0)
+                ctx->wait_for_keyframe--;
             return 0;
         }
         ctx->wait_for_keyframe = 0;
@@ -1341,14 +1414,31 @@ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
 
     mp_set_av_packet(ctx->avpkt, pkt, &ctx->codec_timebase);
 
+    if (pkt && ctx->check_dovi_packets) {
+        bool dovi = av_packet_get_side_data(ctx->avpkt, AV_PKT_DATA_DOVI_CONF, NULL);
+        if (!dovi && avctx->codec_id == AV_CODEC_ID_HEVC) {
+            size_t size;
+            const uint8_t *extra = av_packet_get_side_data(
+                ctx->avpkt, AV_PKT_DATA_NEW_EXTRADATA, &size);
+            if (extra && size)
+                ctx->hevc_nal_length_size = mp_hevc_nal_length_size(extra, size);
+            dovi = mp_hevc_packet_has_dovi_rpu(ctx->avpkt, ctx->hevc_nal_length_size);
+        }
+        if (dovi) {
+            reject_dovi_packet(vd, pkt);
+            return 0;
+        }
+    }
+
     bool reject_hdr10 = pkt && ctx->vo && (ctx->vo->caps & VO_CAP_NATIVE_HDR10) &&
         !mp_native_hdr10_packet(ctx->codec->lav_codecpar, ctx->avpkt);
     int ret = reject_hdr10 ? 0 : avcodec_send_packet(avctx, pkt ? ctx->avpkt : NULL);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
         return ret;
 
-    if (ctx->hw_probing && (native_output(ctx) || ctx->hwdec_opts->software_fallback <= 32)) {
-        if (ctx->num_sent_packets < 32) {
+    if (ctx->hw_probing && (native_output(ctx) || ctx->check_dovi_packets ||
+                           ctx->hwdec_opts->software_fallback <= HWDEC_PROBE_PACKETS)) {
+        if (ctx->num_sent_packets < HWDEC_PROBE_PACKETS) {
             pkt = pkt ? demux_copy_packet(vd->packet_pool, pkt) : NULL;
             MP_TARRAY_APPEND(ctx, ctx->sent_packets, ctx->num_sent_packets, pkt);
         } else if (pkt && native_output(ctx)) {
@@ -1455,6 +1545,15 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
         ctx->sent_packets = NULL;
         ctx->num_sent_packets = 0;
 
+        bool dovi_fallback = ctx->dovi && ctx->check_dovi_packets;
+        if (dovi_fallback) {
+            // Detection can happen while retrying buffered packets after another
+            // decoder failed. Preserve the packets that have not been fed yet.
+            for (int n = 0; n < ctx->num_requeue_packets; n++)
+                MP_TARRAY_APPEND(ctx, pkts, num_pkts, ctx->requeue_packets[n]);
+            ctx->num_requeue_packets = 0;
+        }
+
         force_fallback(vd);
         if (!ctx->avctx || ctx->force_eof) {
             for (int n = 0; n < num_pkts; n++)
@@ -1467,6 +1566,8 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
         TA_FREEP(&ctx->requeue_packets);
         ctx->requeue_packets = pkts;
         ctx->num_requeue_packets = num_pkts;
+        if (dovi_fallback)
+            ctx->wait_for_keyframe = -1;
 
         return 0; // force retry
     }
@@ -1510,9 +1611,7 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
     }
 
     if (ctx->hw_probing) {
-        for (int n = 0; n < ctx->num_sent_packets; n++)
-            demux_packet_pool_push(vd->packet_pool, ctx->sent_packets[n]);
-        ctx->num_sent_packets = 0;
+        discard_probe_packets(vd);
         ctx->hw_probing = false;
     }
 
@@ -1618,6 +1717,7 @@ static struct mp_decoder *create(struct mp_filter *parent,
     ctx->hwdec_opts_cache = m_config_cache_alloc(ctx, vd->global, &hwdec_conf);
     ctx->hwdec_opts = ctx->hwdec_opts_cache->opts;
     ctx->codec = codec;
+    ctx->dovi = codec_has_dovi(codec);
     ctx->decoder = talloc_strdup(ctx, decoder);
     ctx->hwdec_swpool = mp_image_pool_new(ctx);
     ctx->dr_pool = mp_image_pool_new(ctx);

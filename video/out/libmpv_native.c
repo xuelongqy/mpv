@@ -15,9 +15,15 @@
 #include "libmpv.h"
 #include "misc/bstr.h"
 
+unsigned mp_hevc_nal_length_size(const uint8_t *extradata, size_t size)
+{
+    return extradata && size >= 23 && extradata[0] == 1 ?
+        (extradata[21] & 3) + 1 : 0;
+}
+
 static bool is_hvcc(const AVCodecParameters *params)
 {
-    return params->extradata && params->extradata_size >= 23 && params->extradata[0] == 1;
+    return mp_hevc_nal_length_size(params->extradata, params->extradata_size) != 0;
 }
 
 static bool hdr10_nal(bstr nal)
@@ -54,6 +60,48 @@ static bstr next_annexb_nal(const uint8_t **start, const uint8_t *end)
     const uint8_t *nal = *start + 3;
     *start = start_code(nal, end);
     return (bstr){(uint8_t *)nal, (*start ? *start : end) - nal};
+}
+
+// Returns 1 for a NAL unit, 0 at the end, and -1 for an invalid length.
+static int next_packet_nal(const uint8_t **start, const uint8_t *end,
+                           unsigned length_size, bstr *nal)
+{
+    const uint8_t *p = *start;
+    if (!p || p == end)
+        return 0;
+    if (!length_size) {
+        *nal = next_annexb_nal(start, end);
+        return 1;
+    }
+    if (end - p < length_size)
+        return -1;
+    uint32_t size = 0;
+    for (unsigned i = 0; i < length_size; i++)
+        size = (size << 8) | *p++;
+    if (size > end - p)
+        return -1;
+    *nal = (bstr){(uint8_t *)p, size};
+    *start = p + size;
+    return 1;
+}
+
+bool mp_hevc_packet_has_dovi_rpu(const AVPacket *pkt, unsigned length_size)
+{
+    if (!pkt->size)
+        return false;
+    const uint8_t *p = pkt->data;
+    const uint8_t *end = p + pkt->size;
+    if (!length_size)
+        p = start_code(p, end);
+
+    bstr nal;
+    while (next_packet_nal(&p, end, length_size, &nal) > 0) {
+        // NAL type 62, layer and temporal ID 0, with the Dolby RPU prefix and type 2.
+        if (nal.len >= 7 && AV_RB16(nal.start) == 0x7c01 &&
+            nal.start[2] == 0x19 && (nal.start[3] >> 2) == 2)
+            return true;
+    }
+    return false;
 }
 
 static bstr trim_trailing_zeros(bstr nal)
@@ -177,25 +225,18 @@ bool mp_native_hdr10_packet(const AVCodecParameters *params, const AVPacket *pkt
         return false;
     const uint8_t *p = pkt->data;
     const uint8_t *end = p + pkt->size;
-    if (!is_hvcc(params)) {
-        const uint8_t *start = start_code(p, end);
-        if (!start)
+    unsigned length_size = mp_hevc_nal_length_size(params->extradata, params->extradata_size);
+    if (!length_size) {
+        p = start_code(p, end);
+        if (!p)
             return false;
-        do {
-            if (!hdr10_packet_nal(params, next_annexb_nal(&start, end)))
-                return false;
-        } while (start);
-        return true;
     }
 
-    unsigned length_size = (params->extradata[21] & 3) + 1;
-    while (end - p >= length_size) {
-        uint32_t size = 0;
-        for (unsigned i = 0; i < length_size; i++)
-            size = (size << 8) | *p++;
-        if (size > end - p || !hdr10_packet_nal(params, (bstr){(uint8_t *)p, size}))
+    bstr nal;
+    int ret;
+    while ((ret = next_packet_nal(&p, end, length_size, &nal)) > 0) {
+        if (!hdr10_packet_nal(params, nal))
             return false;
-        p += size;
     }
-    return p == end;
+    return ret == 0;
 }

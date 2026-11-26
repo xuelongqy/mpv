@@ -1447,6 +1447,9 @@ Video
     :crystalhd: copies video back to system RAM (Any platform supported by hardware)
     :rkmpp:     requires ``--vo=gpu`` (some RockChip devices only)
 
+    On Android, ``mediacodec`` and ``mediacodec-copy`` are skipped for streams
+    identified as Dolby Vision, because these decoders do not pass Dolby Vision
+    metadata to the renderer. The usual decoder fallback rules apply.
 
     ``auto`` tries to automatically enable hardware decoding using the
     first available method, but allows only whitelisted methods that are

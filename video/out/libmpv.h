@@ -110,6 +110,8 @@ extern const struct render_backend_fns render_backend_android;
 bool mp_native_hdr10_codec(const struct mp_codec_params *codec);
 struct AVCodecParameters;
 struct AVPacket;
+unsigned mp_hevc_nal_length_size(const uint8_t *extradata, size_t size);
+bool mp_hevc_packet_has_dovi_rpu(const struct AVPacket *pkt, unsigned length_size);
 bool mp_native_hdr10_packet(const struct AVCodecParameters *params, const struct AVPacket *pkt);
 bool mp_render_context_get_recovery(mpv_render_context *ctx, uint64_t serial,
                                     bool *try_render);
