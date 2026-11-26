@@ -50,9 +50,11 @@ int libmpv_gpu_context_create(struct render_backend *backend,
                               struct libmpv_gpu_context **out)
 {
     *out = NULL;
-    char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
+    const char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
     if (!api)
         return MPV_ERROR_INVALID_PARAMETER;
+    if (!strcmp(api, MPV_RENDER_API_TYPE_D3D11_GPU_NEXT))
+        api = MPV_RENDER_API_TYPE_D3D11;
 
     for (int n = 0; context_backends[n]; n++) {
         const struct libmpv_gpu_context_fns *fns = context_backends[n];

@@ -33,6 +33,10 @@ API changes
 ::
 
  --- downstream branch (not an upstream API release) ---
+ 2.10   - add MPV_RENDER_API_TYPE_D3D11_GPU_NEXT for the libplacebo renderer.
+          It uses the existing D3D11 initialization and target parameters
+          and supports 8-bit SDR and floating-point scRGB HDR render targets.
+          Both mpv and libplacebo must be built with D3D11 support.
  2.9    - stabilize the Apple Native Render API v1 and install render_apple.h on Apple
         - add the output policy, Apple initialization and Apple target parameters
           to the public contract at their existing values (25, 26 and 27)

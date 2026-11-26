@@ -343,8 +343,9 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
     char *selector = NULL;
     const char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
     bool d3d11 = api && !strcmp(api, MPV_RENDER_API_TYPE_D3D11);
+    bool d3d11_gpu_next = api && !strcmp(api, MPV_RENDER_API_TYPE_D3D11_GPU_NEXT);
     // D3D11 uses parameter 21 for its device initialization structure.
-    for (int n = 0; !d3d11 && params && params[n].type; n++) {
+    for (int n = 0; !d3d11 && !d3d11_gpu_next && params && params[n].type; n++) {
         if (params[n].type == MPV_RENDER_PARAM_RENDERER) {
             selector_present = true;
             selector = params[n].data;
@@ -369,8 +370,12 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
         }
     }
 
-    if (d3d11 && !selected)
-        selected = &render_backend_gpu;
+    if (!selected) {
+        if (d3d11)
+            selected = &render_backend_gpu;
+        if (d3d11_gpu_next)
+            selected = &render_backend_gpu_next;
+    }
 
     int err = MPV_ERROR_NOT_IMPLEMENTED;
     if (ctx->auto_output && !selected) {

@@ -49,7 +49,8 @@ extern "C" {
  * Supported backends
  * ------------------
  *
- * Direct3D 11: via MPV_RENDER_API_TYPE_D3D11, see render_d3d11.h header.
+ * Direct3D 11: via MPV_RENDER_API_TYPE_D3D11 or
+ * MPV_RENDER_API_TYPE_D3D11_GPU_NEXT, see render_d3d11.h header.
  * OpenGL: via MPV_RENDER_API_TYPE_OPENGL, see render_gl.h header.
  * Software: via MPV_RENDER_API_TYPE_SW, see section "Software renderer"
  *
@@ -428,8 +429,9 @@ typedef enum mpv_render_param_type {
      * Select the video renderer. Valid only for mpv_render_context_create().
      * Type: char*
      *
-     * Unavailable with API_TYPE "d3d11", where this number is used for
-     * MPV_RENDER_PARAM_D3D11_INIT_PARAMS and the legacy GPU renderer is used.
+     * Unavailable with API_TYPE "d3d11" or "d3d11-gpu-next", where this number
+     * is used for MPV_RENDER_PARAM_D3D11_INIT_PARAMS. Those API types select
+     * their renderer directly.
      *
      * Supported values:
      *  "gpu"
@@ -505,14 +507,14 @@ typedef enum mpv_render_param_type {
     MPV_RENDER_PARAM_DISPLAY_HDR10_CAPABLE = 30,
     /**
      * Required parameters for initializing the Direct3D 11 renderer. Valid
-     * for mpv_render_context_create() with API_TYPE "d3d11".
+     * for mpv_render_context_create() with API_TYPE "d3d11" or "d3d11-gpu-next".
      * Type: mpv_d3d11_init_params*
      */
     MPV_RENDER_PARAM_D3D11_INIT_PARAMS = 21,
     /**
      * Describes a D3D11 render target. Valid for mpv_render_context_render().
-     * The context must use API_TYPE "d3d11". This number is also used for
-     * MPV_RENDER_PARAM_VULKAN_INIT_PARAMS at Vulkan context creation.
+     * The context must use API_TYPE "d3d11" or "d3d11-gpu-next". This number is
+     * also used for MPV_RENDER_PARAM_VULKAN_INIT_PARAMS at Vulkan context creation.
      * Type: mpv_d3d11_fbo*
      */
     MPV_RENDER_PARAM_D3D11_FBO = 22,
@@ -560,6 +562,7 @@ typedef struct mpv_render_param {
  */
 // See render_d3d11.h
 #define MPV_RENDER_API_TYPE_D3D11 "d3d11"
+#define MPV_RENDER_API_TYPE_D3D11_GPU_NEXT "d3d11-gpu-next"
 // See render_gl.h
 #define MPV_RENDER_API_TYPE_OPENGL "opengl"
 // See section "Software renderer"

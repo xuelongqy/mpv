@@ -33,7 +33,7 @@ static int init(struct libmpv_gpu_context *ctx, mpv_render_param *params)
     if (!init_params || !init_params->device)
         return MPV_ERROR_INVALID_PARAMETER;
 
-    struct ra_ctx *ra_ctx = talloc_zero(p, struct ra_ctx);
+    struct ra_ctx *ra_ctx = ctx->ra_ctx = talloc_zero(p, struct ra_ctx);
     ra_ctx->log = ctx->log;
     ra_ctx->global = ctx->global;
 
@@ -44,7 +44,6 @@ static int init(struct libmpv_gpu_context *ctx, mpv_render_param *params)
     if (!ra_ctx->ra)
         return MPV_ERROR_UNSUPPORTED;
 
-    ctx->ra_ctx = ra_ctx;
     return 0;
 }
 
@@ -83,13 +82,18 @@ static void done_frame(struct libmpv_gpu_context *ctx, bool ds)
 static void destroy(struct libmpv_gpu_context *ctx)
 {
     struct priv *p = ctx->priv;
+    struct ra_ctx *ra_ctx = ctx->ra_ctx;
+    if (!ra_ctx)
+        return;
 
-    if (ctx->ra_ctx && ctx->ra_ctx->ra) {
-        ra_tex_free(ctx->ra_ctx->ra, &p->wrapped_tex);
+    if (ra_ctx->ra) {
+        ra_tex_free(ra_ctx->ra, &p->wrapped_tex);
         // ra_d3d11 frees its own struct from inside its destroy callback.
-        ctx->ra_ctx->ra->fns->destroy(ctx->ra_ctx->ra);
-        ctx->ra_ctx->ra = NULL;
+        ra_ctx->ra->fns->destroy(ra_ctx->ra);
+        ra_ctx->ra = NULL;
     }
+    if (ra_ctx->spirv && ra_ctx->spirv->fns->uninit)
+        ra_ctx->spirv->fns->uninit(ra_ctx);
 }
 
 const struct libmpv_gpu_context_fns libmpv_gpu_context_d3d11 = {

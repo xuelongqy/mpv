@@ -36,11 +36,26 @@ extern "C" {
  * section documents specifics for the Direct3D 11 backend.
  *
  * Use mpv_render_context_create() with MPV_RENDER_PARAM_API_TYPE set to
- * MPV_RENDER_API_TYPE_D3D11, and MPV_RENDER_PARAM_D3D11_INIT_PARAMS provided.
+ * MPV_RENDER_API_TYPE_D3D11 for the legacy GPU renderer, or
+ * MPV_RENDER_API_TYPE_D3D11_GPU_NEXT for the libplacebo renderer. Provide
+ * MPV_RENDER_PARAM_D3D11_INIT_PARAMS in either case. The libplacebo renderer
+ * requires client API version 2.10 or newer and a build with D3D11 support in
+ * both mpv and libplacebo. Check the return value of mpv_render_context_create().
  *
  * Call mpv_render_context_render() with MPV_RENDER_PARAM_D3D11_FBO to render
  * the video frame to a D3D11 texture. The API user is responsible for creating
- * and presenting the texture (for example, via a DXGI swap chain).
+ * and presenting the texture (for example, via a DXGI swap chain). Use
+ * mpv_render_context_report_swap() as described in render.h.
+ *
+ * The libplacebo renderer supports DXGI_FORMAT_B8G8R8A8_UNORM and
+ * DXGI_FORMAT_R8G8B8A8_UNORM for SDR, and DXGI_FORMAT_R16G16B16A16_FLOAT for
+ * HDR. It derives the default output color space from the target format.
+ * The 8-bit formats default to sRGB with BT.709 primaries. The floating-point
+ * format defaults to scRGB, an extended linear BT.709 space that preserves
+ * values outside the SDR range. The renderer disables dithering for scRGB.
+ * To display HDR from this format, the caller
+ * must configure DXGI presentation for DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+ * on an HDR-capable output with HDR enabled.
  *
  * Direct3D 11 state
  * -----------------
@@ -93,10 +108,10 @@ typedef struct mpv_d3d11_fbo {
      *
      * The texture must have been created with at least the
      * D3D11_BIND_RENDER_TARGET bind flag and D3D11_USAGE_DEFAULT usage. It
-     * must not be multisampled, a texture array, or mipmapped. Formats like
-     * DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
-     * DXGI_FORMAT_R10G10B10A2_UNORM and DXGI_FORMAT_R16G16B16A16_FLOAT are
-     * supported. sRGB formats are not supported.
+     * must not be multisampled, a texture array, or mipmapped. In addition to
+     * the formats listed above, the legacy renderer accepts formats such as
+     * DXGI_FORMAT_R10G10B10A2_UNORM.
+     * Neither renderer accepts hardware sRGB texture formats (_UNORM_SRGB).
      *
      * The texture is owned by the caller. mpv_render_context_render() submits
      * all its rendering to the immediate context before it returns, and keeps
