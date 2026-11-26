@@ -45,65 +45,67 @@ static const struct native_resource_entry native_resource_map[] = {
     },
 };
 
-int libmpv_gpu_context_create(struct render_backend *backend,
-                              mpv_render_param *params, void *parent,
+void libmpv_gpu_context_destroy(struct libmpv_gpu_context **pctx)
+{
+    struct libmpv_gpu_context *ctx = *pctx;
+    if (!ctx)
+        return;
+
+    ctx->fns->destroy(ctx);
+    talloc_free(ctx->priv);
+    talloc_free(ctx);
+    *pctx = NULL;
+}
+
+int libmpv_gpu_context_create(struct mpv_global *global, struct mp_log *log,
+                              mpv_render_param *params,
                               struct libmpv_gpu_context **out)
 {
-    *out = NULL;
     const char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
     if (!api)
         return MPV_ERROR_INVALID_PARAMETER;
     if (!strcmp(api, MPV_RENDER_API_TYPE_D3D11_GPU_NEXT))
         api = MPV_RENDER_API_TYPE_D3D11;
 
+    struct libmpv_gpu_context *ctx = NULL;
     for (int n = 0; context_backends[n]; n++) {
-        const struct libmpv_gpu_context_fns *fns = context_backends[n];
-        if (strcmp(fns->api_name, api) != 0)
-            continue;
-        *out = talloc_zero(NULL, struct libmpv_gpu_context);
-        **out = (struct libmpv_gpu_context) {
-            .global = backend->global,
-            .log = backend->log,
-            .fns = fns,
-        };
-        break;
+        const struct libmpv_gpu_context_fns *backend = context_backends[n];
+        if (strcmp(backend->api_name, api) == 0) {
+            ctx = talloc_zero(NULL, struct libmpv_gpu_context);
+            *ctx = (struct libmpv_gpu_context){
+                .global = global,
+                .log = log,
+                .fns = backend,
+            };
+            break;
+        }
     }
 
-    if (!*out)
+    if (!ctx)
         return MPV_ERROR_NOT_IMPLEMENTED;
 
-    int err = (*out)->fns->init(*out, params);
-    if (err < 0)
+    int err = ctx->fns->init(ctx, params);
+    if (err < 0) {
+        libmpv_gpu_context_destroy(&ctx);
         return err;
+    }
 
     for (int n = 0; params && params[n].type; n++) {
-        if (params[n].type <= 0 ||
-            params[n].type >= MP_ARRAY_SIZE(native_resource_map) ||
-            !native_resource_map[params[n].type].name)
-            continue;
-
-        const struct native_resource_entry *entry =
-            &native_resource_map[params[n].type];
-        void *data = params[n].data;
-        if (entry->size)
-            data = talloc_memdup(parent, data, entry->size);
-        ra_add_native_resource((*out)->ra_ctx->ra, entry->name, data);
+        if (params[n].type > 0 &&
+            params[n].type < MP_ARRAY_SIZE(native_resource_map) &&
+            native_resource_map[params[n].type].name)
+        {
+            const struct native_resource_entry *entry =
+                &native_resource_map[params[n].type];
+            void *data = params[n].data;
+            if (entry->size)
+                data = talloc_memdup(ctx, data, entry->size);
+            ra_add_native_resource(ctx->ra_ctx->ra, entry->name, data);
+        }
     }
 
+    *out = ctx;
     return 0;
-}
-
-void libmpv_gpu_context_destroy(struct libmpv_gpu_context **context)
-{
-    struct libmpv_gpu_context *ctx = *context;
-    if (!ctx)
-        return;
-    if (ctx->priv) {
-        ctx->fns->destroy(ctx);
-        talloc_free(ctx->priv);
-    }
-    talloc_free(ctx);
-    *context = NULL;
 }
 
 static int init(struct render_backend *ctx, mpv_render_param *params)
@@ -111,7 +113,7 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     ctx->priv = talloc_zero(NULL, struct priv);
     struct priv *p = ctx->priv;
 
-    int err = libmpv_gpu_context_create(ctx, params, p, &p->context);
+    int err = libmpv_gpu_context_create(ctx->global, ctx->log, params, &p->context);
     if (err < 0)
         return err;
 
@@ -262,6 +264,7 @@ static void destroy(struct render_backend *ctx)
 }
 
 const struct render_backend_fns render_backend_gpu = {
+    .renderer = MPV_RENDER_RENDERER_GPU,
     .init = init,
     .check_format = check_format,
     .set_parameter = set_parameter,

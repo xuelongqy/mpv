@@ -54,6 +54,14 @@ extern "C" {
  * OpenGL: via MPV_RENDER_API_TYPE_OPENGL, see render_gl.h header.
  * Software: via MPV_RENDER_API_TYPE_SW, see section "Software renderer"
  *
+ * Renderers
+ * ---------
+ *
+ * The backend determines the graphics API of the target surface. Which of
+ * mpv's video renderers draws into it is selected independently with
+ * MPV_RENDER_PARAM_RENDERER on APIs that allow both renderers. With Direct3D
+ * 11, the API type selects the renderer directly.
+ *
  * Threading
  * ---------
  *
@@ -434,9 +442,9 @@ typedef enum mpv_render_param_type {
      * their renderer directly.
      *
      * Supported values:
-     *  "gpu"
+     *  MPV_RENDER_RENDERER_GPU ("gpu")
      *      Select the legacy GPU renderer.
-     *  "gpu-next"
+     *  MPV_RENDER_RENDERER_GPU_NEXT ("gpu-next")
      *      Select the libplacebo GPU renderer.
      *
      * If omitted, the renderer is selected as before based on the API type.
@@ -574,6 +582,12 @@ typedef struct mpv_render_param {
 #define MPV_RENDER_API_TYPE_ANDROID_NATIVE "android-native"
 
 /**
+ * Predefined values for MPV_RENDER_PARAM_RENDERER.
+ */
+#define MPV_RENDER_RENDERER_GPU "gpu"
+#define MPV_RENDER_RENDERER_GPU_NEXT "gpu-next"
+
+/**
  * Flags used in mpv_render_frame_info.flags. Each value represents a bit in it.
  */
 typedef enum mpv_render_frame_info_flag {
@@ -658,6 +672,7 @@ typedef struct mpv_render_frame_info {
  * You should pass the following parameters:
  *  - MPV_RENDER_PARAM_API_TYPE to select the underlying backend/GPU API.
  *  - Backend-specific init parameter, like MPV_RENDER_PARAM_OPENGL_INIT_PARAMS.
+ *  - MPV_RENDER_PARAM_RENDERER to select the video renderer where supported.
  *  - Setting MPV_RENDER_PARAM_ADVANCED_CONTROL and following its rules is
  *    strongly recommended.
  *  - If you want to use hwdec, possibly hwdec interop resources.
@@ -673,9 +688,9 @@ typedef struct mpv_render_frame_info {
  * @return error code, including but not limited to:
  *      MPV_ERROR_UNSUPPORTED: the OpenGL version is not supported
  *                             (or required extensions are missing)
- *      MPV_ERROR_NOT_IMPLEMENTED: an unknown API type was provided, or
- *                                 support for the requested API was not
- *                                 built in the used libmpv binary.
+ *      MPV_ERROR_NOT_IMPLEMENTED: an unknown API type was provided, or the
+ *                                 requested API or renderer combination
+ *                                 is not supported by the libmpv binary.
  *      MPV_ERROR_INVALID_PARAMETER: at least one of the provided parameters was
  *                                   not valid.
  */

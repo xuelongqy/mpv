@@ -79,6 +79,7 @@ enum pl_color_levels mppl_video_get_output_levels(struct mppl_video *p);
 void mppl_video_set_paused(struct mppl_video *p, bool paused);
 bool mppl_video_showing_interpolated_frame(struct mppl_video *p);
 void mppl_video_reset(struct mppl_video *p, bool defer_until_new_id);
+void mppl_video_flush(struct mppl_video *p);
 void mppl_video_perfdata(struct mppl_video *p, struct voctrl_performance_data *perf);
 void mppl_video_screenshot(struct mppl_video *p, struct vo_frame *frame,
                            struct voctrl_screenshot *args);

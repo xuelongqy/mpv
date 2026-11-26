@@ -64,6 +64,9 @@ API changes
           Vulkan support remains optional; use matching headers and library.
           Client API version alone does not identify future draft revisions.
  2.6    - add MPV_RENDER_PARAM_RENDERER for the downstream render API
+ --- mpv 0.43.0 ---
+ 2.7    - upstream adds MPV_RENDER_PARAM_RENDERER and defaults to gpu-next.
+          This fork retains its own parameter numbers and default selection.
  --- mpv 0.42.0 ---
  2.6    - add MPV_RENDER_API_TYPE_D3D11 render API backend, along with
           MPV_RENDER_PARAM_D3D11_INIT_PARAMS and MPV_RENDER_PARAM_D3D11_FBO,

@@ -24,6 +24,7 @@
 
 #include "config.h"
 
+_Static_assert(MPV_RENDER_PARAM_RENDERER == 21, "Renderer selection parameter ABI");
 _Static_assert(MPV_RENDER_PARAM_D3D11_INIT_PARAMS == 21, "D3D11 init parameter ABI");
 _Static_assert(MPV_RENDER_PARAM_D3D11_FBO == 22, "D3D11 target parameter ABI");
 _Static_assert(MPV_RENDER_PARAM_OUTPUT_MODE == 25, "Output mode parameter ABI");

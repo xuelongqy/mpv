@@ -142,7 +142,7 @@ struct mppl_video {
     bool want_seek_reset;
     bool flush_cache;
     bool paused;
-    int last_ref_white;
+    float last_ref_luma;
     int last_srgb_power22;
     int req_frames;
 
@@ -296,7 +296,7 @@ struct mp_image *mppl_video_get_image(struct mppl_video *p, int imgfmt, int w, i
                                       int stride_align, int flags)
 {
     pl_gpu gpu = p->gpu;
-    if (!gpu->limits.thread_safe || !gpu->limits.max_mapped_size)
+    if (!gpu->limits.max_mapped_size)
         return NULL;
 
     if ((flags & VO_DR_FLAG_HOST_CACHED) && !gpu->limits.host_cached)
@@ -1348,6 +1348,15 @@ static void push_frame(struct mppl_video *p, pl_queue queue,
     });
 }
 
+static void reset_queue(struct mppl_video *p)
+{
+    pl_queue_reset(p->queue);
+    p->last_pts = 0.0;
+    p->last_id = 0;
+    p->want_reset = false;
+    p->flush_cache = true;
+}
+
 void mppl_video_begin_frame(struct mppl_video *p, struct vo_frame *frame,
                             struct pl_color_space display_csp, float display_ref_luma)
 {
@@ -1359,6 +1368,11 @@ void mppl_video_begin_frame(struct mppl_video *p, struct vo_frame *frame,
     struct frame_params fpar = get_frame_params(p, frame);
     bool can_interpolate = fpar.can_interpolate;
     double pts_offset = fpar.pts_offset;
+
+    // Reset the queue to map the frame again with new value.
+    float ref_luma = get_ref_luma(p);
+    p->want_reset = p->want_reset || p->last_ref_luma != ref_luma;
+    p->last_ref_luma = ref_luma;
 
     // Frames up to last_id were pushed before the seek. Redraws of them keep
     // the queue as it is, the reset happens with the first new frame.
@@ -1392,13 +1406,8 @@ void mppl_video_begin_frame(struct mppl_video *p, struct vo_frame *frame,
     for (int n = 0; n < frame->num_frames; n++) {
         int id = frame->frame_id + n;
 
-        if (p->want_reset) {
-            pl_queue_reset(p->queue);
-            p->last_pts = 0.0;
-            p->last_id = 0;
-            p->want_reset = false;
-            p->flush_cache = true;
-        }
+        if (p->want_reset)
+            reset_queue(p);
 
         if (p->flush_cache) {
             pl_renderer_flush_cache(p->rr);
@@ -2037,6 +2046,7 @@ void mppl_video_screenshot(struct mppl_video *p, struct vo_frame *frame,
         update_overlays(p, res, osd_flags,
                         rel, &fp->subs, &image, mpi,
                         mpi->params.stereo3d, 0);
+        fp->osd_sync = 0;
     } else {
         // Disable overlays when blend_subs is disabled
         update_overlays(p, osd, osd_flags, PL_OVERLAY_COORDS_DST_FRAME,
@@ -2179,6 +2189,14 @@ void mppl_video_reset(struct mppl_video *p, bool defer_until_new_id)
     p->want_seek_reset = defer_until_new_id;
     if (!defer_until_new_id)
         p->want_reset = true;
+}
+
+// Drop the queued frames and what was mapped for them.
+void mppl_video_flush(struct mppl_video *p)
+{
+    reset_queue(p);
+    slot_uninit(p, &p->hwdec);
+    slot_uninit(p, &p->el_hwdec);
 }
 
 void mppl_video_perfdata(struct mppl_video *p, struct voctrl_performance_data *perf)
@@ -2894,10 +2912,8 @@ static void update_render_options(struct mppl_video *p)
     MP_DBG(p, "Render options updated, flushing renderer cache.\n");
     p->flush_cache = p->paused || !p->next_opts->inter_preserve;
 
-    // These options are baked into mapped frames. Reset the queue to map the
+    // This option is baked into mapped frames. Reset the queue to map the
     // queued frames again.
-    p->want_reset = p->want_reset || p->last_ref_white != opts->hdr_reference_white;
     p->want_reset = p->want_reset || ((p->last_srgb_power22 ^ opts->treat_srgb_as_power22) & 1);
-    p->last_ref_white = opts->hdr_reference_white;
     p->last_srgb_power22 = opts->treat_srgb_as_power22;
 }

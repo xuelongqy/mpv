@@ -1,3 +1,20 @@
+/*
+ * This file is part of mpv.
+ *
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * mpv is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 #include <libplacebo/config.h>
 
 #include "config.h"
@@ -22,6 +39,7 @@ struct priv {
     struct libmpv_gpu_context *context;
     struct gpu_ctx *gpu;
     struct mppl_video *renderer;
+    bstr icc_profile;
 #if HAVE_VULKAN
     struct libmpv_vk *vk;
 #endif
@@ -54,7 +72,8 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
         return MPV_ERROR_NOT_IMPLEMENTED;
 #endif
     } else {
-        int err = libmpv_gpu_context_create(ctx, params, p, &p->context);
+        int err = libmpv_gpu_context_create(ctx->global, ctx->log, params,
+                                            &p->context);
         if (err < 0)
             return err;
 
@@ -84,6 +103,13 @@ static bool check_format(struct render_backend *ctx, int imgfmt)
     return mppl_video_check_format(p->renderer, imgfmt);
 }
 
+// Reloading renderer options can discard the active profile.
+static bool update_icc_profile(struct priv *p)
+{
+    return !mppl_video_icc_auto_enabled(p->renderer) ||
+           mppl_video_set_icc_profile(p->renderer, bstrdup(NULL, p->icc_profile));
+}
+
 static int set_parameter(struct render_backend *ctx, mpv_render_param param)
 {
     struct priv *p = ctx->priv;
@@ -95,26 +121,32 @@ static int set_parameter(struct render_backend *ctx, mpv_render_param param)
         return MPV_ERROR_NOT_IMPLEMENTED;
     if (!param.data)
         return MPV_ERROR_INVALID_PARAMETER;
-    if (!mppl_video_icc_auto_enabled(p->renderer))
-        return 0;
 
     mpv_byte_array *data = param.data;
-    bstr icc = bstrdup(NULL, (bstr){data->data, data->size});
-    return mppl_video_set_icc_profile(p->renderer, icc)
-           ? 0 : MPV_ERROR_GENERIC;
+    talloc_free(p->icc_profile.start);
+    p->icc_profile = bstrdup(p, (bstr){data->data, data->size});
+    return update_icc_profile(p) ? 0 : MPV_ERROR_GENERIC;
 }
 
 static void reconfig(struct render_backend *ctx, struct mp_image_params *params)
 {
     struct priv *p = ctx->priv;
+    if (!params->imgfmt)
+        mppl_video_flush(p->renderer);
     mppl_video_config(p->renderer, params);
 }
 
 static void reset(struct render_backend *ctx)
 {
     struct priv *p = ctx->priv;
-    // The render context can outlive the VO that assigns frame IDs.
+    // Also used when the output policy switches render backends midstream.
     mppl_video_reset(p->renderer, false);
+}
+
+static void set_paused(struct render_backend *ctx, bool paused)
+{
+    struct priv *p = ctx->priv;
+    mppl_video_set_paused(p->renderer, paused);
 }
 
 static void update_external(struct render_backend *ctx, struct vo *vo)
@@ -125,6 +157,7 @@ static void update_external(struct render_backend *ctx, struct vo *vo)
         return;
 
     mppl_video_reload_options(p->renderer);
+    update_icc_profile(p);
     p->gpu->ra_ctx->opts.want_alpha = mppl_video_want_alpha(p->renderer);
     mppl_video_configure_queue(p->renderer, vo);
 }
@@ -371,11 +404,13 @@ static void destroy(struct render_backend *ctx)
 }
 
 const struct render_backend_fns render_backend_gpu_next = {
+    .renderer = MPV_RENDER_RENDERER_GPU_NEXT,
     .init = init,
     .check_format = check_format,
     .set_parameter = set_parameter,
     .reconfig = reconfig,
     .reset = reset,
+    .set_paused = set_paused,
     .update_external = update_external,
     .resize = resize,
     .get_target_size = get_target_size,

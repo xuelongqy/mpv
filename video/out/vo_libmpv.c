@@ -105,12 +105,15 @@ struct mpv_render_context {
     bool need_resize;
     bool need_reset;
     bool need_update_external;
+    bool paused;
     struct vo *vo;
     bool native_rejected, recovering, dovi, hdr;
     const struct mp_codec_params *native_codec;
     enum native_video native_video;
     int display_hdr10;
     uint64_t output_generation;
+    uint64_t frame_id_offset;       // added to the frame IDs of the VO
+    uint64_t last_frame_id;         // highest ID a frame was passed on with
 
     // --- Mostly immutable after init.
     struct mp_hwdec_devices *hwdec_devs;
@@ -340,7 +343,7 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
         }
     }
     bool selector_present = false;
-    char *selector = NULL;
+    const char *selector = NULL;
     const char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
     bool d3d11 = api && !strcmp(api, MPV_RENDER_API_TYPE_D3D11);
     bool d3d11_gpu_next = api && !strcmp(api, MPV_RENDER_API_TYPE_D3D11_GPU_NEXT);
@@ -360,9 +363,9 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
         if (!selector || !selector[0]) {
             mpv_render_context_free(ctx);
             return MPV_ERROR_INVALID_PARAMETER;
-        } else if (strcmp(selector, "gpu") == 0) {
+        } else if (strcmp(selector, MPV_RENDER_RENDERER_GPU) == 0) {
             selected = &render_backend_gpu;
-        } else if (strcmp(selector, "gpu-next") == 0) {
+        } else if (strcmp(selector, MPV_RENDER_RENDERER_GPU_NEXT) == 0) {
             selected = &render_backend_gpu_next;
         } else {
             mpv_render_context_free(ctx);
@@ -427,6 +430,9 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
         mpv_render_context_free(ctx);
         return err;
     }
+
+    if (ctx->renderer->fns->renderer)
+        MP_VERBOSE(ctx, "Using the %s renderer.\n", ctx->renderer->fns->renderer);
 
     ctx->hwdec_devs = ctx->renderer->hwdec_devs;
 
@@ -618,6 +624,9 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
         ctx->renderer->fns->reconfig(ctx->renderer, &ctx->img_params);
     ctx->need_reconfig = false;
 
+    if (ctx->renderer->fns->set_paused)
+        ctx->renderer->fns->set_paused(ctx->renderer, ctx->paused);
+
     if (ctx->need_update_external)
         ctx->renderer->fns->update_external(ctx->renderer, ctx->vo);
     ctx->need_update_external = false;
@@ -801,6 +810,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
     mp_assert(!ctx->next_frame);
     ctx->next_frame = vo_frame_ref(frame);
+    if (frame->num_frames) {
+        ctx->next_frame->frame_id += ctx->frame_id_offset;
+        ctx->last_frame_id = ctx->next_frame->frame_id + frame->num_frames - 1;
+    }
     ctx->expected_flip_count = ctx->flip_count + 1;
     ctx->redrawing = frame->redraw || !frame->current;
     mp_mutex_unlock(&ctx->lock);
@@ -1015,7 +1028,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
         vo->want_redraw = true;
         return VO_TRUE;
     case VOCTRL_PAUSE:
+        mp_mutex_lock(&ctx->lock);
+        ctx->paused = true;
+        mp_mutex_unlock(&ctx->lock);
         vo->want_redraw = true;
+        return VO_TRUE;
+    case VOCTRL_RESUME:
+        mp_mutex_lock(&ctx->lock);
+        ctx->paused = false;
+        mp_mutex_unlock(&ctx->lock);
         return VO_TRUE;
     case VOCTRL_SET_PANSCAN:
         mp_mutex_lock(&ctx->lock);
@@ -1118,6 +1139,8 @@ static void uninit(struct vo *vo)
     ctx->vo = NULL;
     ctx->recovering = false;
     ctx->native_codec = NULL;
+    ctx->paused = false;
+    ctx->frame_id_offset = ctx->last_frame_id;
 
     // The following do not normally need ctx->lock, however, ctx itself may
     // become invalid once we release ctx->lock.
